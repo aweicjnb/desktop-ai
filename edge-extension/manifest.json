@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Desktop AI · DeepSeek",
+  "version": "0.1.0",
+  "description": "让 Desktop AI 使用当前 Edge 用户配置中已登录的 DeepSeek 网页。",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApn+iHZ4MdOJCAOJS3XXb2Yy8qNs5K8YJPJQ2hxMzX3pu1qWpgWyFla7P2cK4YqoA8EAZaYolI+i1ZRR+K9XSyD/OhSqfyBVsWqDqY7dg2JyJc1QexzF8fD+ii80QIXPV2n/fEIF6N5D1QQLWiWpfPfFAGDIUuF5EI5V0TMuLuZaO/Hzf9qi6Jaht4mmmgnO4xZE4cjgITylforLOJQJvmKYGmnqLO5LDunsfTSvNQmsEELldFJaxlFpPMl+dCN8/V1CML09c0GrpsXyjE8ydaKuhMPXHfT+eAhBa5YoH7JYzFmx6iremQRljzT4GiyUxzAwycZb1W+hBMFCVoW8E4wIDAQAB",
+  "permissions": ["storage", "alarms", "scripting"],
+  "host_permissions": ["https://chat.deepseek.com/*", "http://127.0.0.1/*"],
+  "action": { "default_popup": "pair.html", "default_title": "Desktop AI" },
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{
+    "matches": ["https://chat.deepseek.com/*"],
+    "js": ["content.js"]
+  }]
+}

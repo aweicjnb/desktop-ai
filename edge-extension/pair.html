@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width">
+    <title>Desktop AI</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { font: 14px/1.5 "Segoe UI", "Microsoft YaHei UI", sans-serif; margin: 0; min-width: 280px; padding: 18px; }
+      h1 { margin: 0 0 12px; font-size: 17px; }
+      label { display: block; margin-bottom: 5px; }
+      form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+      input, button { box-sizing: border-box; font: inherit; border: 1px solid #7778; border-radius: 6px; padding: 6px 8px; }
+      input { width: 100%; }
+      button { background: light-dark(#5147c0, #b5aaff); color: light-dark(white, #211842); }
+      p { margin: 9px 0 0; }
+    </style>
+  </head>
+  <body>
+    <h1>连接 Desktop AI</h1>
+    <label for="token">粘贴桌面弹窗的连接码</label>
+    <form>
+      <input id="token" type="password" required maxlength="100" autocomplete="off" spellcheck="false">
+      <button type="submit">连接</button>
+    </form>
+    <p id="status" role="status"></p>
+    <script src="pair.js"></script>
+  </body>
+</html>
