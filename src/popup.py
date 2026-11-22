@@ -13,7 +13,8 @@ import winreg
 from bridge import Bridge, ORIGIN
 from answer_view import AnswerView
 from controls import IconButton, SettingsPanel, WindowResize, rounded
-from windows import InputMethod, Integration, application, enable_high_dpi, open_edge, single_instance
+from diagnostics import record, record_callback_error, start_logging
+from windows import APP_ASSETS, InputMethod, Integration, application, enable_high_dpi, open_edge, single_instance
 
 
 LIGHT = dict(window="#FFFFFF", chrome="#F8F8FC", ink="#1B1E2C", muted="#606477",
@@ -24,6 +25,8 @@ DARK = dict(window="#181A24", chrome="#1C1E2A", ink="#F1F0F8", muted="#A9ACC0",
             action="#AD9EFF", action_ink="#211842", input="#232635", input_border="#796DB3")
 PROMPT_LIMIT = 18000
 INPUT_FONT_SIZE = 11
+REQUEST_START_TIMEOUT = 50
+STOP_TIMEOUT_MS = 4000
 
 
 def palette():
@@ -52,6 +55,9 @@ class Popup:
         self.thought = ""
         self.started = self.needs_login = self.thought_open = False
         self.ready = self.demo
+        self.request_started = 0
+        self.first_delta = False
+        self.stop_requested = False
         self.deadline = 0
         self.focus_grace = 0
         self.drag_offset = (0, 0)
@@ -60,15 +66,18 @@ class Popup:
         root.update_idletasks()
         self.ime = InputMethod(root, self.input, INPUT_FONT_SIZE, self.font(INPUT_FONT_SIZE)[0])
         if not demo:
+            root.report_callback_exception = lambda kind, _value, stack: record_callback_error(kind, stack, self.active)
             try:
                 self.bridge = Bridge()
-            except OSError:
+            except OSError as error:
+                record("bridge.start_failed", error=type(error).__name__, errno=error.errno)
                 self.set_notice("无法启动本地连接。请检查端口 41692 是否被占用。")
             else:
                 self.show_setup()
         if not smoke:
             self.windows = Integration(root, self.show, self.show_menu)
             if not self.windows.hotkey:
+                record("desktop.hotkey_unavailable")
                 self.set_notice("快捷键已被占用，可以双击系统托盘图标打开。")
             self.root.after(75, self.tick)
 
@@ -130,13 +139,21 @@ class Popup:
         frame.pack(fill="both", expand=True, padx=self.dp(1), pady=self.dp(1))
         title = tk.Frame(frame, bg=c["chrome"], padx=self.dp(12), pady=self.dp(5))
         title.pack(fill="x")
-        star = self.label(title, "✦", 14, "accent", "tint", width=3)
-        star.pack(side="left")
+        try:
+            avatar = tk.PhotoImage(master=r, file=str(APP_ASSETS / "desktop-ai.png"))
+        except tk.TclError:
+            mark = self.label(title, "✦", 14, "accent", "tint", width=3)
+        else:
+            r.iconphoto(True, avatar)
+            sample = max(1, round(avatar.width() / self.dp(24)))
+            self.header_icon = avatar.subsample(sample)
+            mark = self.label(title, image=self.header_icon, bg="chrome")
+        mark.pack(side="left")
         brand = self.label(title, "DeepSeek", 11, bg="chrome")
         brand.pack(side="left", padx=self.dp(7))
         self.settings_button = IconButton(title, "settings", self.toggle_settings, c, self.scale, "chrome")
         self.settings_button.pack(side="right")
-        for widget in (title, star, brand):
+        for widget in (title, mark, brand):
             widget.bind("<ButtonPress-1>", self.start_drag)
             widget.bind("<B1-Motion>", self.drag)
         tk.Frame(frame, bg=c["line"], height=self.dp(1)).pack(fill="x")
@@ -315,8 +332,10 @@ class Popup:
         self.menu.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
 
     def exit(self):
+        if not self.demo:
+            record("desktop.exit", self.active)
         if self.active and self.bridge:
-            self.bridge.jobs.put({"type": "stop", "id": self.active})
+            self.cancel_browser_request()
         if self.windows:
             self.windows.close()
         if self.bridge:
@@ -443,13 +462,15 @@ class Popup:
             self.set_notice(f"单次最多可发送 {PROMPT_LIMIT} 个字符，请缩短后重试。")
             return
         if not self.ready:
+            record("desktop.submit_blocked", reason="bridge_unavailable")
             if self.bridge:
                 self.show_setup()
             return
         self.active = uuid.uuid4().hex
         self.pending_prompt = text
-        self.started = self.needs_login = False
-        self.deadline = time.monotonic() + 325
+        self.started = self.needs_login = self.first_delta = False
+        self.request_started = time.monotonic()
+        self.deadline = self.request_started + 325
         self.reset()
         self.set_notice()
         self.question.configure(text=text)
@@ -464,6 +485,8 @@ class Popup:
         if self.demo:
             self.run_demo(self.active)
         else:
+            record("desktop.queued", self.active, search=self.search_on.get(), thinking=self.thinking_on.get())
+            self.bridge.active_request = self.active
             self.bridge.jobs.put(dict(type="ask", id=self.active, day=date.today().isoformat(),
                                       prompt=text, search=self.search_on.get(), thinking=self.thinking_on.get()))
 
@@ -489,14 +512,30 @@ class Popup:
         self.root.after(500, begin)
 
     def stop(self):
-        if not self.active:
+        if not self.active or self.stop_requested:
             return
         if self.demo:
             self.finish("已停止")
         else:
+            self.record_request("stop_requested")
+            self.stop_requested = True
             self.stop_button.set_enabled(False)
             self.status.configure(text="正在停止…")
-            self.bridge.jobs.put({"type": "stop", "id": self.active})
+            self.cancel_browser_request()
+            self.root.after(STOP_TIMEOUT_MS, self.stop_timed_out, self.active)
+
+    def cancel_browser_request(self):
+        self.bridge.active_request = None
+        self.bridge.jobs.put({"type": "stop", "id": self.active})
+
+    def stop_timed_out(self, request):
+        if self.active == request and self.stop_requested:
+            self.finish_unconfirmed_stop("stop_timeout")
+
+    def finish_unconfirmed_stop(self, stage):
+        self.record_request(stage)
+        self.finish("已停止等待")
+        self.set_notice("未收到网页的停止确认。可以打开 Edge 查看生成状态。", (("打开 Edge 查看", self.open_login),))
 
     def delta(self, answer, thought, search):
         self.answer, self.thought = answer, thought
@@ -504,17 +543,22 @@ class Popup:
             self.answer_view.pack(fill="x", pady=(self.dp(5), 0))
             self.answer_view.set_source(answer)
             self.copy_button.pack(side="right")
-            self.status.configure(text="●  回答中")
+            if not self.stop_requested:
+                self.status.configure(text="●  回答中")
             self.empty.pack_forget()
         else:
             self.answer_view.pack_forget()
             self.copy_button.pack_forget()
-            phase = "搜索中" if search == "searching" else "思考中" if thought else "已发送"
-            self.status.configure(text="●  " + phase)
+            if not self.stop_requested:
+                phase = "搜索中" if search == "searching" else "思考中" if thought else "已发送"
+                self.status.configure(text="●  " + phase)
         self.paint_thought()
 
     def finish(self, status):
+        if self.bridge:
+            self.bridge.active_request = None
         self.active = None
+        self.stop_requested = False
         self.pending_prompt = ""
         self.status.configure(text=status)
         if self.empty.winfo_manager():
@@ -535,6 +579,10 @@ class Popup:
             self.replace_input(prompt)
         self.set_notice(description, (("去 Edge 登录", self.open_login),) if login else ())
 
+    def record_request(self, stage, **fields):
+        elapsed_ms = round((time.monotonic() - self.request_started) * 1000)
+        record("desktop." + stage, self.active, elapsed_ms=elapsed_ms, **fields)
+
     def accept(self, event):
         if event.get("id") != self.active or not self.active:
             return
@@ -542,12 +590,27 @@ class Popup:
         if kind == "started":
             self.started = True
         elif kind == "delta":
-            self.delta(str(event.get("answer", "")), str(event.get("thought", "")), event.get("search", ""))
+            answer = str(event.get("answer", ""))
+            if not self.first_delta:
+                self.first_delta = True
+                self.record_request("first_delta", has_answer=bool(answer))
+            if answer and not self.answer:
+                self.record_request("first_answer")
+            self.delta(answer, str(event.get("thought", "")), event.get("search", ""))
         elif kind == "complete":
+            answer = event.get("answer")
+            if isinstance(answer, str) and answer:
+                self.delta(answer, str(event.get("thought", "")), event.get("search", ""))
+            self.record_request("complete", has_answer=bool(self.answer))
             self.finish("●  已完成")
         elif kind == "stopped":
-            self.finish("已停止")
+            if event.get("confirmed") is False:
+                self.finish_unconfirmed_stop("stop_unconfirmed")
+            else:
+                self.record_request("stopped")
+                self.finish("已停止")
         elif kind in ("login", "error"):
+            self.record_request(kind, started=self.started)
             self.fail(str(event.get("text") or "网页请求失败，请在 Edge 查看。"), login=kind == "login")
 
     def tick(self):
@@ -561,6 +624,7 @@ class Popup:
             connected = self.bridge.connected
             if self.ready != connected:
                 self.ready = connected
+                record("desktop.edge_connected" if connected else "desktop.edge_disconnected", self.active)
                 if connected and not self.needs_login:
                     self.set_notice()
                 elif not connected and not self.active and not self.needs_login:
@@ -570,11 +634,20 @@ class Popup:
                     self.accept(self.bridge.events.get_nowait())
                 except Empty:
                     break
-            if self.active and time.monotonic() >= self.deadline:
-                self.bridge.jobs.put({"type": "stop", "id": self.active})
+            now = time.monotonic()
+            if self.active and not self.stop_requested and now >= self.deadline:
+                self.record_request("reply_timeout", started=self.started, received_delta=self.first_delta)
+                self.cancel_browser_request()
                 self.fail("等待网页回答超时，请在 Edge 查看。")
-            elif self.active and not connected:
+            elif self.active and not self.stop_requested and not connected:
+                self.record_request("request_lost_connection", started=self.started, received_delta=self.first_delta)
+                self.cancel_browser_request()
                 self.fail("与 Edge 的连接中断，请确认扩展和浏览器仍在运行。")
+            elif (self.active and not self.stop_requested and not (self.started or self.first_delta)
+                  and now - self.request_started >= REQUEST_START_TIMEOUT):
+                self.record_request("start_timeout")
+                self.cancel_browser_request()
+                self.fail("未收到 DeepSeek 网页开始回复的信号，请在 Edge 查看页面状态。")
         self.root.after(75, self.tick)
 
 
@@ -582,24 +655,31 @@ def main():
     enable_high_dpi()
     demo = "--demo" in sys.argv
     smoke = "--smoke" in sys.argv
+    background = "--background" in sys.argv
     mutex = None
     if not (demo or smoke):
         mutex, created = single_instance()
         if not created:
-            root = tk.Tk()
-            root.withdraw()
-            messagebox.showinfo("Desktop AI", "Desktop AI 已在托盘运行。")
-            root.destroy()
+            if not background:
+                root = tk.Tk()
+                root.withdraw()
+                messagebox.showinfo("Desktop AI", "Desktop AI 已在托盘运行。")
+                root.destroy()
             if mutex:
                 application.CloseHandle(mutex)
             return
+        start_logging()
+        record("desktop.started", background=background)
     try:
         root = tk.Tk()
+        if background:
+            root.withdraw()
         popup = Popup(root, demo=demo or smoke, smoke=smoke)
         if smoke:
             popup.exit()
             return
-        popup.show()
+        if not background:
+            popup.show()
         root.mainloop()
     finally:
         if mutex:

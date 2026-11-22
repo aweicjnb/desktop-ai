@@ -134,13 +134,17 @@
     if (job.stopped) {
       render(job, 'stopped', { url: sessionUrl() || job.url, parent: job.parent });
     } else if (status === 401 || status === 403) {
-      render(job, 'login', { text: '请在 Edge 确认登录状态或完成验证。' });
+      render(job, 'login', { diagnostic: 'stream_login', http_status: status,
+        text: '请在 Edge 确认登录状态或完成验证。' });
     } else if (job.error || status < 200 || status >= 300 || !job.answer.trim()) {
-      render(job, 'error', { text: job.error || '网页没有返回可显示的正文，请在 Edge 查看。' });
+      render(job, 'error', { diagnostic: 'stream_no_reply', http_status: status,
+        text: job.error || '网页没有返回可显示的正文，请在 Edge 查看。' });
     } else if (!job.finished) {
-      render(job, 'error', { text: '网页连接中断。已保留收到的内容。' });
+      render(job, 'error', { diagnostic: 'stream_interrupted', http_status: status,
+        text: '网页连接中断。已保留收到的内容。' });
     } else {
-      render(job, 'complete', { url: sessionUrl() || job.url, parent: job.parent });
+      render(job, 'complete', { url: sessionUrl() || job.url, parent: job.parent,
+        answer: job.answer, thought: job.thought, search: job.search });
     }
   }
 

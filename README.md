@@ -76,11 +76,14 @@ Desktop AI 是一个 Windows 托盘工具。按 `Ctrl+Shift+Y`，就能在当前
 
 **程序提示无法启动本机连接** · `41692` 是桌面程序与扩展的本机通信端口。关闭占用该端口的进程后重新启动 Desktop AI。
 
+**发送后卡住或没有回答** · 在资源管理器地址栏输入 `%LOCALAPPDATA%\DesktopAI`，打开 `diagnostics.log`。用 `request=` 后的编号串起同一次请求。`desktop.queued` 表示已排队，`edge.job_received` 表示扩展已取到请求，`bridge.received_started` 表示扩展已捕获网页请求，`desktop.complete` 表示弹窗已处理完成事件。`elapsed_ms` 是从弹窗发送起计算的耗时。
+
 ## 本机数据
 
 - 问题通过已登录的浏览器发送给 DeepSeek，网页会话记录由 DeepSeek 管理。
 - 桌面程序在内存中展示当前回答和草稿。设置与配对连接码保存在当前 Windows 用户的 `%LOCALAPPDATA%\DesktopAI`。扩展在当前浏览器用户配置中保存连接码和当天会话定位信息。
 - 桌面程序监听 `127.0.0.1:41692`，扩展通过连接码配对。DeepSeek 的登录凭据由 Edge 管理。
+- 诊断日志写入本机，每个文件最多约 512 KiB，保留两份轮转备份。日志记录流程阶段和错误类型，问题正文、回答、连接码、登录凭据和会话链接均不写入。
 
 ## 从源码运行
 

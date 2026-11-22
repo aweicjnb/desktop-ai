@@ -9,10 +9,13 @@ import secrets
 import threading
 import time
 
+from diagnostics import record, record_edge
+
 
 PORT = 41692
 ORIGIN = "chrome-extension://phkjcieoiikackdmcbkfbfmmjnookdoo"
 MAX_BODY = 1024 * 1024
+REPLY_EVENTS = ("started", "complete", "stopped", "login", "error")
 
 
 def connection_code():
@@ -90,14 +93,26 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 job = bridge.jobs.get(timeout=11)
             except Empty:
                 job = None
+            if job and job.get("type") == "ask" and job.get("id") != bridge.active_request:
+                record("bridge.skipped_cancelled_ask", job.get("id"))
+                job = None
+            if job and job.get("type") in ("ask", "stop"):
+                record("bridge.polled_" + job["type"], job.get("id"))
             self.respond(200, job)
         elif self.path == "/event":
             event = request.get("event")
-            if isinstance(event, dict):
-                bridge.events.put(event)
-                self.respond(200, True)
-            else:
+            if not isinstance(event, dict):
                 self.respond(400, None)
+                return
+            kind = event.get("type")
+            if kind == "diagnostic":
+                accepted = record_edge(event)
+                self.respond(200 if accepted else 400, True if accepted else None)
+                return
+            if kind in REPLY_EVENTS:
+                record("bridge.received_" + kind, event.get("id"))
+            bridge.events.put(event)
+            self.respond(200, True)
         else:
             self.respond(404, None)
 
@@ -106,11 +121,13 @@ class Bridge:
     def __init__(self):
         self.token = connection_code()
         self.last_seen = float("-inf")
+        self.active_request = None
         self.jobs = Queue()
         self.events = Queue()
         self.server = ThreadingHTTPServer(("127.0.0.1", PORT), BridgeHandler)
         self.server.bridge = self
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        record("bridge.listening", port=PORT)
 
     @property
     def connected(self):

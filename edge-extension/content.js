@@ -33,25 +33,31 @@
     if ((button.getAttribute('aria-pressed') === 'true') !== desired) button.click();
   }
 
+  function setEditorValue(input, value) {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(input, value);
+    input.dispatchEvent(new InputEvent('input', { bubbles: true,
+      inputType: value ? 'insertText' : 'deleteContentBackward', data: value || null }));
+  }
+
   async function ask(message) {
     const input = editor();
     if (!input) return { ok: false, login: probe().kind === 'login', text: 'DeepSeek 输入区暂不可用。' };
     if (pending || input.value.trim()) {
       return { ok: false, text: 'DeepSeek 标签页有尚未处理的输入或请求，请在 Edge 检查。' };
     }
-    const job = { id: message.id, input };
+    const job = { id: message.id, input, prompt: message.prompt, submitted: false };
     pending = job;
     try {
       toggle(['深度思考', 'DeepThink', 'DeepThink (R1)', 'Deep thinking', 'Thinking'], message.thinking === true);
       toggle(['智能搜索', '联网搜索', 'Search', 'Web Search', 'Smart Search'], message.search === true);
-      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(input, message.prompt);
-      input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: message.prompt }));
+      setEditorValue(input, job.prompt);
       await sleep(40);
       if (pending !== job) return { ok: false, text: '已停止。' };
       if (!input.isConnected || input.value !== message.prompt) throw new Error('网页没有接受输入，请检查 DeepSeek 标签页。');
 
       emit('arm', { id: message.id, prompt: message.prompt });
       const button = composerButton(input);
+      job.submitted = true;
       if (button && button.getAttribute('aria-disabled') !== 'true' && !button.disabled) {
         button.click();
       } else {
@@ -64,7 +70,7 @@
         pending = null;
         emit('disarm', { id: job.id });
         const needsLogin = probe().kind === 'login' || /请完成真人验证|verify you.re human/i.test(document.body.innerText);
-        relay({ type: needsLogin ? 'login' : 'error', id: job.id,
+        relay({ type: needsLogin ? 'login' : 'error', id: job.id, diagnostic: 'no_stream',
           text: needsLogin ? '请在 Edge 完成登录或验证。' : '网页没有开始回答，请在 Edge 查看后再试。' });
       }, 25000);
       return { ok: true };
@@ -93,14 +99,19 @@
       void ask(message).then(reply);
       return true;
     } else if (message.type === 'stop') {
-      if (pending?.id === message.id) {
-        const job = pending;
-        pending = null;
-        clearTimeout(job.timer);
-        const input = editor();
-        if (job.input === input && !input.value.trim()) composerButton(input)?.click();
-        emit('abort', { id: message.id });
+      if (pending?.id !== message.id) {
+        reply(false);
+        return;
       }
+      const job = pending;
+      pending = null;
+      clearTimeout(job.timer);
+      const input = editor();
+      if (job.input === input) {
+        if (!job.submitted && input.value === job.prompt) setEditorValue(input, '');
+        else if (job.submitted && !input.value.trim()) composerButton(input)?.click();
+      }
+      emit('abort', { id: message.id });
       reply(true);
     }
   });

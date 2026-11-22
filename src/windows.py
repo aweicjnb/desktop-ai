@@ -16,6 +16,9 @@ TRAY_MESSAGE = 0x8001
 HOTKEY = 1
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
+IMAGE_ICON = 1
+LR_LOADFROMFILE = 0x0010
+APP_ASSETS = Path(__file__).resolve().parents[1] / "assets"
 
 
 class NotifyIcon(ct.Structure):
@@ -72,6 +75,10 @@ user.DestroyWindow.argtypes = (w.HWND,)
 user.UnregisterClassW.argtypes = (w.LPCWSTR, w.HINSTANCE)
 user.LoadIconW.argtypes = (w.HINSTANCE, ct.c_void_p)
 user.LoadIconW.restype = w.HICON
+user.LoadImageW.argtypes = (w.HINSTANCE, w.LPCWSTR, w.UINT, ct.c_int, ct.c_int, w.UINT)
+user.LoadImageW.restype = w.HICON
+user.DestroyIcon.argtypes = (w.HICON,)
+user.DestroyIcon.restype = w.BOOL
 shell.Shell_NotifyIconW.argtypes = (w.DWORD, ct.POINTER(NotifyIcon))
 application.CreateMutexW.argtypes = (ct.c_void_p, w.BOOL, w.LPCWSTR)
 application.CreateMutexW.restype = w.HANDLE
@@ -185,9 +192,13 @@ class NativeEvents:
         window_class = WindowClass(procedure=self.callback, instance=instance, name=name)
         atom = user.RegisterClassW(ct.byref(window_class))
         hwnd = user.CreateWindowExW(0x80, name, name, 0, 0, 0, 0, 0, None, None, instance, None) if atom else None
+        dpi = user.GetDpiForWindow(hwnd) if hwnd else 96
+        icon_size = max(16, round(16 * dpi / 96))
+        custom_icon = user.LoadImageW(None, str(APP_ASSETS / "desktop-ai.ico"),
+                                      IMAGE_ICON, icon_size, icon_size, LR_LOADFROMFILE)
         tray = NotifyIcon(
             cbSize=ct.sizeof(NotifyIcon), hwnd=hwnd, identifier=1, flags=1 | 2 | 4,
-            callback=TRAY_MESSAGE, icon=user.LoadIconW(None, 32512), tip="Desktop AI · DeepSeek",
+            callback=TRAY_MESSAGE, icon=custom_icon or user.LoadIconW(None, 32512), tip="Desktop AI · DeepSeek",
         )
         try:
             self.tray_added = bool(hwnd and shell.Shell_NotifyIconW(0, ct.byref(tray)))
@@ -203,6 +214,8 @@ class NativeEvents:
                 user.UnregisterHotKey(None, HOTKEY)
             if self.tray_added:
                 shell.Shell_NotifyIconW(2, ct.byref(tray))
+            if custom_icon:
+                user.DestroyIcon(custom_icon)
             if hwnd:
                 user.DestroyWindow(hwnd)
             if atom:
