@@ -6,6 +6,8 @@ import sys
 import tkinter as tk
 from tkinter import font
 
+from controls import FONT_FAMILY, font_pixels
+
 sys.path.insert(0, str(Path(__file__).with_name("_vendor")))
 from mistune import create_markdown
 
@@ -40,11 +42,9 @@ def spans(tokens, tags=()):
 
 class AnswerView(tk.Text):
     def __init__(self, parent, colors, scale):
-        self.dp = lambda n: max(0, round(n * scale))
-        family = "Microsoft YaHei UI"
-        self.regular = font.Font(parent, family=family, size=11)
-        self.bold = font.Font(parent, family=family, size=11, weight="bold")
-        self.code = font.Font(parent, family="Cascadia Mono", size=10)
+        self.regular = font.Font(parent, family=FONT_FAMILY)
+        self.bold = font.Font(parent, family=FONT_FAMILY, weight="bold")
+        self.code = font.Font(parent, family="Cascadia Mono")
         super().__init__(parent, width=1, height=1, wrap="word", font=self.regular, state="disabled",
                          bg=colors["window"], fg=colors["ink"], borderwidth=0, highlightthickness=0,
                          padx=0, pady=0, exportselection=False, takefocus=True, cursor="xterm",
@@ -55,23 +55,18 @@ class AnswerView(tk.Text):
         self.dragging = False
         self.table_number = 0
         self.measure_cache = {}
+        self.scale = scale
         self.tag_configure("strong", font=self.bold)
-        self.tag_configure("emphasis", font=(family, 11, "italic"))
+        self.tag_configure("emphasis", font=(FONT_FAMILY, font_pixels(11, scale), "italic"))
         self.tag_configure("strike", overstrike=True)
         self.tag_configure("link", foreground=colors["accent"], underline=True)
-        self.tag_configure("citation", foreground=colors["muted"], font=(family, 9))
+        self.tag_configure("citation", foreground=colors["muted"])
         self.tag_configure("code", font=self.code, background=colors["soft"])
-        self.tag_configure("code_block", lmargin1=self.dp(9), lmargin2=self.dp(9), rmargin=self.dp(5))
-        self.tag_configure("quote", foreground=colors["muted"], lmargin1=self.dp(12), lmargin2=self.dp(12))
-        self.tag_configure("heading1", font=(family, 15, "bold"), spacing1=self.dp(7), spacing3=self.dp(6))
-        self.tag_configure("heading2", font=(family, 13, "bold"), spacing1=self.dp(5), spacing3=self.dp(5))
-        self.tag_configure("heading3", font=(family, 11, "bold"), spacing1=self.dp(5), spacing3=self.dp(4))
-        self.tag_configure("space", font=(family, 6))
+        self.tag_configure("quote", foreground=colors["muted"])
         self.tag_configure("table_header", background=colors["tint"], foreground=colors["ink"], font=self.bold)
         self.tag_configure("table_row_a", background=colors["soft"])
         self.tag_configure("table_row_b", background=colors["chrome"])
-        self.tag_configure("table_top", spacing1=self.dp(5))
-        self.tag_configure("table_bottom", spacing3=self.dp(5))
+        self.set_scale(scale)
         self.tag_raise("sel")
         self.bind("<Configure>", lambda event: self.schedule(), add="+")
         self.bind("<ButtonPress-1>", self.begin_selection, add="+")
@@ -79,6 +74,35 @@ class AnswerView(tk.Text):
         self.bind("<KeyRelease>", lambda event: self.schedule(), add="+")
         self.bind("<<Copy>>", self.copy_selection)
         self.bind("<Control-a>", self.select_all)
+
+    def dp(self, value):
+        return round(value * self.scale)
+
+    def set_scale(self, scale):
+        ratio = scale / self.scale
+        self.scale = scale
+        px = self.dp
+        self.regular.configure(size=font_pixels(11, scale))
+        self.bold.configure(size=font_pixels(11, scale))
+        self.code.configure(size=font_pixels(10, scale))
+        self.tag_configure("emphasis", font=(FONT_FAMILY, font_pixels(11, scale), "italic"))
+        self.tag_configure("citation", font=(FONT_FAMILY, font_pixels(9, scale)))
+        self.tag_configure("code_block", lmargin1=px(9), lmargin2=px(9), rmargin=px(5))
+        self.tag_configure("quote", lmargin1=px(12), lmargin2=px(12))
+        for level, size, before, after in ((1, 15, 7, 6), (2, 13, 5, 5), (3, 11, 5, 4)):
+            self.tag_configure(f"heading{level}", font=(FONT_FAMILY, font_pixels(size, scale), "bold"),
+                               spacing1=px(before), spacing3=px(after))
+        self.tag_configure("space", font=(FONT_FAMILY, font_pixels(6, scale)))
+        self.tag_configure("table_top", spacing1=px(5))
+        self.tag_configure("table_bottom", spacing3=px(5))
+        # Fit existing tables to the new DPI even when a selection delays reflow.
+        for number in range(1, self.table_number + 1):
+            grid = f"grid{number}"
+            tabs = self.tk.splitlist(self.tag_cget(grid, "tabs"))
+            self.tag_configure(grid, tabs=[round(int(tab) * ratio) for tab in tabs],
+                               lmargin1=px(8), lmargin2=px(8))
+        self.rendered_width = 0
+        self.schedule()
 
     def begin_selection(self, event):
         self.focus_set()

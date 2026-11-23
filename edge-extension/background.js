@@ -5,11 +5,13 @@ const home = origin + '/';
 const bridgeUrl = 'http://127.0.0.1:41692';
 const sessionUrl = /^https:\/\/chat\.deepseek\.com\/a\/chat\/s\/[a-f0-9-]{36}$/i;
 const reconnectAlarm = 'desktop-ai-reconnect';
+const startTimeout = 12000;
 const terminalEvents = ['complete', 'stopped', 'login', 'error'];
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 let bridgeToken;
 let polling = false;
 let eventQueue = Promise.resolve();
+let tabSelection = Promise.resolve();
 let active;
 let stopping;
 
@@ -63,8 +65,14 @@ async function connect() {
     bridgeToken = settings.bridgeToken;
     if (!bridgeToken) return;
     while (bridgeToken) {
-      const message = await localRequest('/poll', bridgeToken);
-      if (message) void receive(message);
+      const message = await localRequest('/poll', bridgeToken, { claim: true });
+      if (!message) continue;
+      const { claimRequired, ...job } = message;
+      if (claimRequired) {
+        const claimed = await localRequest('/claim', bridgeToken, { id: job.id }, 3000);
+        if (!claimed) continue;
+      }
+      void receive(job);
     }
   } catch {
     setTimeout(connect, 2500);
@@ -73,30 +81,82 @@ async function connect() {
   }
 }
 
-async function getTab(url, focus = false) {
-  const { desktopAiTab } = await chrome.storage.session.get('desktopAiTab');
-  let tab;
-  if (desktopAiTab != null) {
-    tab = await chrome.tabs.get(desktopAiTab).catch(() => null);
-    if (!tab?.url?.startsWith(home) && !tab?.pendingUrl?.startsWith(home)) tab = null;
+function tabUrl(tab) {
+  return (tab?.pendingUrl || tab?.url || '').split(/[?#]/, 1)[0];
+}
+
+function getTab(options) {
+  const selected = tabSelection.then(() => selectTab(options));
+  tabSelection = selected.catch(() => {});
+  return selected;
+}
+
+async function selectTab({ day, focus = false }) {
+  const { dailySession, desktopAiTabRef } = await chrome.storage.local.get(['dailySession', 'desktopAiTabRef']);
+  const lastUrl = sessionUrl.test(dailySession?.url) ? dailySession.url : null;
+  let tab = null;
+  if (Number.isInteger(desktopAiTabRef?.id)) {
+    const candidate = await chrome.tabs.get(desktopAiTabRef.id).catch(() => null);
+    const url = tabUrl(candidate);
+    // A stored ID can outlive its browser session. Check the page as well.
+    if (url.startsWith(home) && (candidate.id === active?.tabId || url === desktopAiTabRef.url || url === lastUrl ||
+        /^\/(?:login|sign_?in|sign_?up|register)(?:\/|$)/i.test(url.slice(origin.length)))) {
+      tab = candidate;
+    }
   }
+  if (!tab && lastUrl) {
+    const candidates = await chrome.tabs.query({ url: lastUrl + '*' });
+    tab = candidates.filter(candidate => tabUrl(candidate) === lastUrl)
+      .sort((first, second) => Number(Boolean(first.discarded)) - Number(Boolean(second.discarded)) ||
+        second.id - first.id)[0];
+  }
+
+  const url = day ? (dailySession?.day === day && lastUrl) || home : tabUrl(tab) || lastUrl || home;
   if (!tab) {
     tab = await chrome.tabs.create({ url, active: focus });
-    await chrome.storage.session.set({ desktopAiTab: tab.id });
-  } else if (tab.url !== url && tab.pendingUrl !== url) {
+  } else if (tabUrl(tab) !== url || (!focus && (tab.discarded || tab.frozen))) {
     tab = await chrome.tabs.update(tab.id, { url, active: focus || tab.active });
   } else if (focus && !tab.active) {
     tab = await chrome.tabs.update(tab.id, { active: true });
   }
+  const ref = { id: tab.id, url: tabUrl(tab) || url };
+  if (ref.id !== desktopAiTabRef?.id || ref.url !== desktopAiTabRef?.url) {
+    await chrome.storage.local.set({ desktopAiTabRef: ref }).catch(() => {});
+  }
   if (focus) await chrome.windows.update(tab.windowId, { focused: true });
-  return tab;
+  return { tab, url };
 }
 
 function finish(job, message) {
   if (active !== job) return;
+  clearTimeout(job.startDeadline);
   clearTimeout(job.deadline);
   active = null;
   post({ id: job.id, ...message });
+}
+
+function acknowledgeStart(job, notify = true) {
+  if (job.started) return;
+  job.started = true;
+  clearTimeout(job.startDeadline);
+  if (notify) post({ type: 'started', id: job.id });
+}
+
+async function verifyStart(job) {
+  if (active !== job || job.started || job.stopping) return;
+  // This timer runs in the extension, independently of timers on a hidden page.
+  const result = await Promise.race([
+    chrome.tabs.sendMessage(job.tabId, { type: 'verify-start', id: job.id }).catch(() => null),
+    sleep(1500).then(() => null)
+  ]);
+  if (active !== job || job.started || job.stopping) return;
+  if (result?.type === 'started') {
+    acknowledgeStart(job);
+    return;
+  }
+  diagnose(job.id, 'no_stream');
+  finish(job, { type: result?.type === 'login' ? 'login' : 'error',
+    text: result?.text || 'DeepSeek 网页未确认发送。问题已保留，请先查看网页再重试。' });
 }
 
 async function ask(message) {
@@ -109,16 +169,23 @@ async function ask(message) {
   const job = { id: message.id, day: message.day, tabId: null, parent: null, persistence: Promise.resolve() };
   active = job;
   try {
-    const { dailySession } = await chrome.storage.local.get('dailySession');
-    const url = dailySession?.day === job.day && sessionUrl.test(dailySession.url)
-      ? dailySession.url : home;
-    const tab = await getTab(url);
+    const { tab, url } = await getTab({ day: job.day });
     if (active !== job || job.stopping) return;
     job.tabId = tab.id;
 
-    let state;
+    let state, injectedContent = false;
     for (let attempt = 0; attempt < 60 && active === job && !job.stopping; attempt += 1) {
-      try { state = await chrome.tabs.sendMessage(tab.id, { type: 'probe' }); } catch { /* Loading. */ }
+      try {
+        state = await chrome.tabs.sendMessage(tab.id, { type: 'probe' });
+      } catch {
+        if (!injectedContent && active === job && !job.stopping) {
+          // Pages left open during an extension reload can lose their content script.
+          injectedContent = await chrome.scripting.executeScript({
+            target: { tabId: tab.id }, files: ['content.js']
+          }).then(() => true, () => false);
+          if (injectedContent) continue;
+        }
+      }
       if (state?.kind === 'login' || state?.kind === 'ready' && state.url === url) break;
       await sleep(300);
     }
@@ -137,14 +204,15 @@ async function ask(message) {
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['stream.js'], world: 'MAIN' });
     if (active !== job || job.stopping) return;
     diagnose(job.id, 'hook_ready');
-    const result = await chrome.tabs.sendMessage(tab.id, message);
+    const result = await chrome.tabs.sendMessage(tab.id, { ...message, type: 'ask' });
     if (active !== job || job.stopping) return;
     if (!result?.ok) {
-      diagnose(job.id, 'composer_rejected');
+      diagnose(job.id, result?.diagnostic === 'image_upload_failed' ? 'image_upload_failed' : 'composer_rejected');
       finish(job, { type: result?.login ? 'login' : 'error', text: result?.text || '网页未能发送消息。' });
       return;
     }
     diagnose(job.id, 'composer_accepted');
+    if (!job.started) job.startDeadline = setTimeout(() => { void verifyStart(job); }, startTimeout);
     job.deadline = setTimeout(() => { void stop(job, true); }, 300000);
   } catch {
     if (job.stopping) return;
@@ -177,22 +245,18 @@ async function stop(job, timedOut = false) {
   if (stopping === job) stopping = null;
 }
 
-async function openPage() {
-  const { desktopAiTab } = await chrome.storage.session.get('desktopAiTab');
-  const tab = desktopAiTab == null ? null : await chrome.tabs.get(desktopAiTab).catch(() => null);
-  if (tab?.url?.startsWith(home)) {
-    await chrome.tabs.update(tab.id, { active: true });
-    await chrome.windows.update(tab.windowId, { focused: true });
-  } else {
-    await getTab(home, true);
-  }
-}
-
 async function receive(message) {
   switch (message?.type) {
     case 'ask':
+    case 'ask_image':
       if (typeof message.id === 'string' && typeof message.prompt === 'string' &&
-          /^\d{4}-\d{2}-\d{2}$/.test(message.day)) await ask(message);
+          /^\d{4}-\d{2}-\d{2}$/.test(message.day)) {
+        if (message.type === 'ask_image' && !message.image) {
+          post({ type: 'error', id: message.id, text: '没有收到图片数据，请重新粘贴后发送。' });
+        } else {
+          await ask(message);
+        }
+      }
       break;
     case 'stop':
       if (typeof message.id !== 'string') break;
@@ -200,7 +264,7 @@ async function receive(message) {
       else post({ type: 'stopped', id: message.id, confirmed: false });
       break;
     case 'open':
-      await openPage().catch(() => {});
+      await getTab({ focus: true }).catch(() => {});
       break;
   }
 }
@@ -208,7 +272,10 @@ async function receive(message) {
 async function saveSession(job, url) {
   if (!sessionUrl.test(url)) return;
   job.persistence = job.persistence.then(() =>
-    chrome.storage.local.set({ dailySession: { day: job.day, url, parent: job.parent } }))
+    chrome.storage.local.set({
+      dailySession: { day: job.day, url, parent: job.parent },
+      desktopAiTabRef: { id: job.tabId, url }
+    }))
     .catch(() => diagnose(job.id, 'session_save_failed'));
   await job.persistence;
 }
@@ -223,7 +290,11 @@ chrome.runtime.onMessage.addListener((event, sender, reply) => {
   if (!job || sender.tab?.id !== job.tabId || sender.frameId !== 0 || event?.id !== job.id) return;
   if (!['started', 'session', 'delta', 'complete', 'stopped', 'login', 'error'].includes(event.type)) return;
   void (async () => {
+    if (['started', 'session', 'delta', 'complete'].includes(event.type)) {
+      acknowledgeStart(job, event.type === 'started' || event.type === 'session');
+    }
     if (event.parent != null) job.parent = event.parent;
+    if (event.type === 'started') return;
     if (event.type === 'session') {
       await saveSession(job, event.url);
     } else if (event.type === 'complete' || event.type === 'stopped') {
@@ -232,7 +303,7 @@ chrome.runtime.onMessage.addListener((event, sender, reply) => {
       finish(job, { type: job.stopping ? 'stopped' : event.type,
         answer: event.answer, thought: event.thought, search: event.search });
     } else if (event.type === 'error' || event.type === 'login') {
-      if (['no_stream', 'stream_login', 'stream_no_reply', 'stream_interrupted'].includes(event.diagnostic)) {
+      if (['no_stream', 'stream_login', 'stream_no_reply', 'stream_interrupted', 'stream_image_missing'].includes(event.diagnostic)) {
         diagnose(job.id, event.diagnostic, event.http_status);
       }
       finish(job, { type: event.type, text: event.text });

@@ -1,9 +1,10 @@
+from collections import deque
 import hmac
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Queue
 import re
 import secrets
 import threading
@@ -16,6 +17,7 @@ PORT = 41692
 ORIGIN = "chrome-extension://phkjcieoiikackdmcbkfbfmmjnookdoo"
 MAX_BODY = 1024 * 1024
 REPLY_EVENTS = ("started", "complete", "stopped", "login", "error")
+ASK_JOBS = ("ask", "ask_image")
 
 
 def connection_code():
@@ -88,17 +90,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if self.path == "/ping":
             self.respond(200, True)
         elif self.path == "/poll":
-            bridge.last_seen = time.monotonic()
-            try:
-                job = bridge.jobs.get(timeout=11)
-            except Empty:
-                job = None
-            if job and job.get("type") == "ask" and job.get("id") != bridge.active_request:
-                record("bridge.skipped_cancelled_ask", job.get("id"))
-                job = None
-            if job and job.get("type") in ("ask", "stop"):
-                record("bridge.polled_" + job["type"], job.get("id"))
-            self.respond(200, job)
+            event = request.get("event")
+            can_claim = isinstance(event, dict) and event.get("claim") is True
+            self.respond(200, bridge.poll_job(can_claim))
+        elif self.path == "/claim":
+            event = request.get("event")
+            claimed = isinstance(event, dict) and bridge.claim_job(event.get("id"))
+            self.respond(200, claimed)
         elif self.path == "/event":
             event = request.get("event")
             if not isinstance(event, dict):
@@ -122,12 +120,51 @@ class Bridge:
         self.token = connection_code()
         self.last_seen = float("-inf")
         self.active_request = None
-        self.jobs = Queue()
+        self.jobs = deque()
+        self.job_ready = threading.Condition()
         self.events = Queue()
         self.server = ThreadingHTTPServer(("127.0.0.1", PORT), BridgeHandler)
         self.server.bridge = self
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         record("bridge.listening", port=PORT)
+
+    def enqueue(self, job):
+        with self.job_ready:
+            self.jobs.append(job)
+            self.job_ready.notify_all()
+
+    def poll_job(self, can_claim):
+        self.last_seen = time.monotonic()
+        with self.job_ready:
+            if not self.job_ready.wait_for(lambda: self.jobs, timeout=11):
+                return None
+            job = self.jobs[0]
+            kind, request_id = job["type"], job.get("id")
+            if kind in ASK_JOBS:
+                if request_id != self.active_request:
+                    self.jobs.popleft()
+                    record("bridge.skipped_cancelled_ask", request_id)
+                    return None
+                if can_claim:
+                    record("bridge.offered_" + kind, request_id)
+                    return {**job, "claimRequired": True}
+            self.jobs.popleft()
+            if kind in (*ASK_JOBS, "stop"):
+                record("bridge.polled_" + kind, request_id)
+            return job
+
+    def claim_job(self, request_id):
+        with self.job_ready:
+            if not isinstance(request_id, str) or request_id != self.active_request or not self.jobs:
+                return False
+            job = self.jobs[0]
+            if job["type"] not in ASK_JOBS or job["id"] != request_id:
+                return False
+            # Only the extension that obtains this claim may send the question.
+            self.jobs.popleft()
+            record("bridge.claimed_" + job["type"], request_id)
+            self.events.put({"type": "received", "id": request_id})
+            return True
 
     @property
     def connected(self):

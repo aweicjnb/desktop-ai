@@ -1,6 +1,14 @@
 import tkinter as tk
 
 
+FONT_FAMILY = "Microsoft YaHei UI"
+
+
+def font_pixels(points, scale):
+    # Negative font sizes are pixels in Tk and bypass its startup DPI.
+    return -max(1, round(points * 96 / 72 * scale))
+
+
 def rounded(canvas, x1, y1, x2, y2, radius, **style):
     radius = min(radius, (y2 - y1) / 2, (x2 - x1) / 2)
     return canvas.create_polygon(
@@ -20,9 +28,7 @@ class WindowResize:
 
     def __init__(self, root, scale):
         self.root = root
-        self.edge = round(6 * scale)
-        self.min_width = min(round(350 * scale), root.winfo_screenwidth())
-        self.min_height = min(round(240 * scale), root.winfo_screenheight())
+        self.set_scale(scale)
         self.drag = None
         self.cursor = None
         self.tag = "DesktopAiResize" + str(id(self))
@@ -32,6 +38,11 @@ class WindowResize:
         root.bind_class(self.tag, "<B1-Motion>", self.move)
         root.bind_class(self.tag, "<ButtonRelease-1>", self.end)
         self.attach(root)
+
+    def set_scale(self, scale):
+        self.edge = round(6 * scale)
+        self.min_width = min(round(350 * scale), self.root.winfo_screenwidth())
+        self.min_height = min(round(240 * scale), self.root.winfo_screenheight())
 
     def attach(self, widget):
         if isinstance(widget, tk.Menu):
@@ -117,9 +128,9 @@ class IconButton(tk.Canvas):
         self.icon, self.command, self.colors = icon, command, colors
         self.scale, self.background = scale, background
         self.enabled, self.hover, self.focused, self.selected = True, False, False, False
-        size = round((30 if icon != "settings" else 29) * scale)
-        super().__init__(parent, bg=colors[background], width=size, height=size, borderwidth=0,
+        super().__init__(parent, bg=colors[background], borderwidth=0,
                          highlightthickness=0, cursor="hand2", takefocus=True)
+        self.set_scale(scale)
         self.bind("<Configure>", self.paint)
         self.bind("<Map>", self.paint)
         self.bind("<Enter>", lambda event: self.set_flag("hover", True))
@@ -129,6 +140,11 @@ class IconButton(tk.Canvas):
         self.bind("<ButtonRelease-1>", self.invoke)
         self.bind("<Return>", self.invoke)
         self.bind("<space>", self.invoke)
+
+    def set_scale(self, scale):
+        self.scale = scale
+        size = round((29 if self.icon == "settings" else 30) * scale)
+        self.configure(width=size, height=size)
 
     def set_flag(self, name, value):
         setattr(self, name, value)
@@ -186,8 +202,8 @@ class SettingsPanel(tk.Canvas):
         self.hover = None
         self.selected = 0
         self.focused = False
-        super().__init__(parent, bg=colors["window"], width=round(202 * scale),
-                         height=round(108 * scale), borderwidth=0, highlightthickness=0, takefocus=True)
+        super().__init__(parent, bg=colors["window"], borderwidth=0, highlightthickness=0, takefocus=True)
+        self.set_scale(scale)
         self.bind("<Configure>", self.paint)
         self.bind("<Motion>", self.motion)
         self.bind("<Leave>", lambda event: self.highlight(None))
@@ -198,6 +214,10 @@ class SettingsPanel(tk.Canvas):
         self.bind("<Down>", lambda event: self.move(1))
         self.bind("<space>", lambda event: self.toggle(self.selected))
         self.bind("<Return>", lambda event: self.toggle(self.selected))
+
+    def set_scale(self, scale):
+        self.scale = scale
+        self.configure(width=round(202 * scale), height=round(108 * scale))
 
     def row_at(self, y):
         local = y / self.scale
@@ -242,13 +262,13 @@ class SettingsPanel(tk.Canvas):
             return
         rounded(self, s, s, w - s, h - s, 12*s, fill=c["chrome"], outline=c["line"], width=max(1, s))
         self.create_text(13*s, 15*s, text="设置", anchor="w", fill=c["muted"],
-                         font=("Microsoft YaHei UI", 9))
+                         font=(FONT_FAMILY, font_pixels(9, s)))
         for index, (label, value) in enumerate(self.options):
             y = (46 + index * 36) * s
             if self.hover == index or (self.focused and self.selected == index):
                 rounded(self, 6*s, y - 15*s, w - 6*s, y + 15*s, 7*s, fill=c["soft"])
             self.create_text(13*s, y, text=label, anchor="w", fill=c["ink"],
-                             font=("Microsoft YaHei UI", 10))
+                             font=(FONT_FAMILY, font_pixels(10, s)))
             x = w - 32*s
             rounded(self, x - 16*s, y - 9*s, x + 16*s, y + 9*s, 9*s,
                     fill=c["action"] if value.get() else c["line"])

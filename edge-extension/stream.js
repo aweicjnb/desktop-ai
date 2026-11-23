@@ -169,9 +169,15 @@
   XMLHttpRequest.prototype.send = function (body) {
     const url = xhrUrl.get(this);
     if (armed && url?.origin === location.origin && url.pathname === completionPath) {
-      let prompt;
-      try { prompt = JSON.parse(body).prompt; } catch { /* Other requests remain untouched. */ }
-      if (prompt === armed.prompt) {
+      let request;
+      try { request = JSON.parse(body); } catch { /* Other requests remain untouched. */ }
+      if (request?.prompt === armed.prompt) {
+        if (armed.image && !request.ref_file_ids?.length) {
+          const job = armed;
+          armed = null;
+          render(job, 'error', { diagnostic: 'stream_image_missing', text: '网页未把图片附到这次消息，请在 Edge 查看。' });
+          return send.call(this, body);
+        }
         const job = {
           id: armed.id, xhr: this, state: {}, cursor: resetPath(), offset: 0, pending: '',
           answer: '', thought: '', search: '', url: '', parent: null

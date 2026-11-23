@@ -14,6 +14,7 @@ EDGE_STAGES = frozenset({
     "job_received", "page_ready", "page_login", "page_unavailable", "hook_ready",
     "composer_accepted", "composer_rejected", "send_failed", "already_busy", "tab_closed",
     "no_stream", "stream_login", "stream_no_reply", "stream_interrupted", "reply_timeout",
+    "image_upload_failed", "stream_image_missing",
     "session_save_failed", "relay_retry", "relay_failed",
 })
 

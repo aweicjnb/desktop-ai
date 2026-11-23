@@ -1,20 +1,27 @@
-from datetime import date
+from base64 import b64encode
 import json
 import os
 from pathlib import Path
-from queue import Empty
+from queue import Empty, Queue
 import sys
 import time
+import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import font as tkfont, messagebox, ttk
 import uuid
 import winreg
 
-from bridge import Bridge, ORIGIN
+from web_account import import_edge_login
+from web_client import WebClient, WebError
+from setup_view import SetupView
 from answer_view import AnswerView
-from controls import IconButton, SettingsPanel, WindowResize, rounded
+from clipboard_image import ClipboardImageError, read_clipboard_image
+from controls import FONT_FAMILY, IconButton, SettingsPanel, WindowResize, font_pixels, rounded
 from diagnostics import record, record_callback_error, start_logging
-from windows import APP_ASSETS, InputMethod, Integration, application, enable_high_dpi, open_edge, single_instance
+from windows import (
+    APP_ASSETS, InputMethod, Integration, application, enable_high_dpi, monitor_work_area,
+    open_edge, single_instance, window_dpi,
+)
 
 
 LIGHT = dict(window="#FFFFFF", chrome="#F8F8FC", ink="#1B1E2C", muted="#606477",
@@ -26,6 +33,7 @@ DARK = dict(window="#181A24", chrome="#1C1E2A", ink="#F1F0F8", muted="#A9ACC0",
 PROMPT_LIMIT = 18000
 INPUT_FONT_SIZE = 11
 REQUEST_START_TIMEOUT = 50
+IMAGE_START_TIMEOUT = 95
 STOP_TIMEOUT_MS = 4000
 
 
@@ -41,16 +49,23 @@ def palette():
 class Popup:
     def __init__(self, root, demo=False, smoke=False):
         self.root, self.demo = root, demo
-        self.scale = root.winfo_fpixels("1i") / 96
+        self.scale = window_dpi(root.winfo_id()) / 96
+        self.fonts = {}
+        self.layout_options = []
         self.colors = palette()
         self.settings_file = None if demo else Path(os.environ["LOCALAPPDATA"]) / "DesktopAI" / "settings.json"
         settings = self.load_settings()
         self.search_on = tk.BooleanVar(root, settings.get("search", True) is not False)
         self.thinking_on = tk.BooleanVar(root, settings.get("thinking", False) is True)
-        self.bridge = self.windows = None
+        self.client = self.windows = None
+        self.setup_results = Queue()
         self.ime = None
         self.active = None
         self.pending_prompt = ""
+        self.draft_image = self.pending_image = None
+        self.draft_preview = self.question_preview = None
+        self.draft_preview_source = self.question_preview_source = None
+        self.header_source = None
         self.answer = ""
         self.thought = ""
         self.started = self.needs_login = self.thought_open = False
@@ -60,20 +75,22 @@ class Popup:
         self.stop_requested = False
         self.deadline = 0
         self.focus_grace = 0
+        self.positioned = False
         self.drag_offset = (0, 0)
         self.build()
         self.resize = WindowResize(root, self.scale)
         root.update_idletasks()
-        self.ime = InputMethod(root, self.input, INPUT_FONT_SIZE, self.font(INPUT_FONT_SIZE)[0])
+        self.ime = InputMethod(root, self.input, INPUT_FONT_SIZE, FONT_FAMILY)
         if not demo:
             root.report_callback_exception = lambda kind, _value, stack: record_callback_error(kind, stack, self.active)
             try:
-                self.bridge = Bridge()
-            except OSError as error:
-                record("bridge.start_failed", error=type(error).__name__, errno=error.errno)
-                self.set_notice("无法启动本地连接。请检查端口 41692 是否被占用。")
-            else:
+                self.client = WebClient()
+                self.ready = True
+            except FileNotFoundError:
                 self.show_setup()
+            except (OSError, ValueError) as error:
+                record("web.start_failed", error=type(error).__name__)
+                self.show_setup("本机登录数据无法读取，请重新导入。")
         if not smoke:
             self.windows = Integration(root, self.show, self.show_menu)
             if not self.windows.hotkey:
@@ -81,11 +98,55 @@ class Popup:
                 self.set_notice("快捷键已被占用，可以双击系统托盘图标打开。")
             self.root.after(75, self.tick)
 
-    def font(self, size, weight="normal"):
-        return ("Microsoft YaHei UI", size, weight)
+    def font(self, size):
+        if size not in self.fonts:
+            self.fonts[size] = tkfont.Font(self.root, family=FONT_FAMILY, size=font_pixels(size, self.scale))
+        return self.fonts[size]
 
     def dp(self, value):
         return round(value * self.scale)
+
+    def scale_options(self, configure, **options):
+        self.layout_options.append((configure, options))
+        self.apply_scaled_options(configure, options)
+
+    def apply_scaled_options(self, configure, options):
+        configure(**{name: tuple(map(self.dp, value)) if isinstance(value, tuple) else self.dp(value)
+                     for name, value in options.items()})
+
+    def set_scale(self, scale):
+        if scale == self.scale:
+            return
+        self.scale = scale
+        for size, face in self.fonts.items():
+            face.configure(size=font_pixels(size, scale))
+        for configure, options in self.layout_options:
+            self.apply_scaled_options(configure, options)
+        for widget in (self.settings_button, self.settings, self.send_button, self.stop_button,
+                       self.answer_view, self.resize, self.setup_panel):
+            widget.set_scale(scale)
+        for widget, padding in ((self.empty, (34, 6)), (self.question_row, (0, 8)),
+                                (self.reason_text, (4, 0)), (self.answer_view, (5, 0))):
+            if widget.winfo_manager():
+                widget.pack_configure(pady=tuple(map(self.dp, padding)))
+        for button in self.notice_actions.winfo_children():
+            button.configure(padx=self.dp(7), pady=self.dp(3))
+            button.pack_configure(padx=(0, self.dp(6)), pady=(self.dp(5), 0))
+        if self.placeholder.winfo_manager():
+            self.placeholder.place_configure(x=self.dp(3), y=self.dp(3))
+        if self.settings.winfo_manager():
+            self.settings.place_configure(x=-self.dp(12), y=self.dp(44))
+        if self.header_source:
+            self.header_icon = self.thumbnail(self.header_source, self.dp(24))
+            self.header_mark.configure(image=self.header_icon)
+        if self.draft_preview_source:
+            self.refresh_draft_preview()
+        if self.question_preview_source:
+            self.question_preview = self.thumbnail(self.question_preview_source, self.dp(38))
+            self.question.configure(image=self.question_preview)
+        self.resize_body()
+        self.root.after_idle(self.paint_input_shell)
+        self.root.after_idle(self.ime.apply)
 
     def load_settings(self):
         if self.settings_file:
@@ -136,8 +197,10 @@ class Popup:
         r.protocol("WM_DELETE_WINDOW", self.hide)
 
         frame = tk.Frame(r, bg=c["window"])
-        frame.pack(fill="both", expand=True, padx=self.dp(1), pady=self.dp(1))
-        title = tk.Frame(frame, bg=c["chrome"], padx=self.dp(12), pady=self.dp(5))
+        frame.pack(fill="both", expand=True)
+        self.scale_options(frame.pack_configure, padx=1, pady=1)
+        title = tk.Frame(frame, bg=c["chrome"])
+        self.scale_options(title.configure, padx=12, pady=5)
         title.pack(fill="x")
         try:
             avatar = tk.PhotoImage(master=r, file=str(APP_ASSETS / "desktop-ai.png"))
@@ -145,24 +208,29 @@ class Popup:
             mark = self.label(title, "✦", 14, "accent", "tint", width=3)
         else:
             r.iconphoto(True, avatar)
-            sample = max(1, round(avatar.width() / self.dp(24)))
-            self.header_icon = avatar.subsample(sample)
+            self.header_source = avatar
+            self.header_icon = self.thumbnail(avatar, self.dp(24))
             mark = self.label(title, image=self.header_icon, bg="chrome")
+        self.header_mark = mark
         mark.pack(side="left")
         brand = self.label(title, "DeepSeek", 11, bg="chrome")
-        brand.pack(side="left", padx=self.dp(7))
+        brand.pack(side="left")
+        self.scale_options(brand.pack_configure, padx=7)
         self.settings_button = IconButton(title, "settings", self.toggle_settings, c, self.scale, "chrome")
         self.settings_button.pack(side="right")
         for widget in (title, mark, brand):
             widget.bind("<ButtonPress-1>", self.start_drag)
             widget.bind("<B1-Motion>", self.drag)
-        tk.Frame(frame, bg=c["line"], height=self.dp(1)).pack(fill="x")
+            widget.bind("<ButtonRelease-1>", self.end_drag)
+        divider = tk.Frame(frame, bg=c["line"])
+        divider.pack(fill="x")
+        self.scale_options(divider.configure, height=1)
 
         self.settings = SettingsPanel(frame, c, self.scale,
                                       (("智能搜索", self.search_on), ("深度思考", self.thinking_on)),
                                       self.save_settings)
         r.bind("<ButtonPress-1>", self.dismiss_settings, add="+")
-        center = tk.Frame(frame, bg=c["window"])
+        center = self.center = tk.Frame(frame, bg=c["window"])
         center.pack(fill="both", expand=True)
         center.grid_columnconfigure(0, weight=1)
         center.grid_rowconfigure(0, weight=1)
@@ -172,12 +240,14 @@ class Popup:
         style.theme_use("clam")
         style.configure("Quiet.Vertical.TScrollbar", background=c["soft"], troughcolor=c["window"],
                         bordercolor=c["window"], lightcolor=c["soft"], darkcolor=c["soft"],
-                        arrowcolor=c["muted"], arrowsize=self.dp(9))
+                        arrowcolor=c["muted"])
+        self.scale_options(lambda **options: style.configure("Quiet.Vertical.TScrollbar", **options), arrowsize=9)
         self.scrollbar = ttk.Scrollbar(center, command=self.canvas.yview, style="Quiet.Vertical.TScrollbar")
         self.scrollbar.grid(row=0, column=1, sticky="ns")
         self.scrollbar.grid_remove()
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
-        self.body = tk.Frame(self.canvas, bg=c["window"], padx=self.dp(15), pady=self.dp(11))
+        self.body = tk.Frame(self.canvas, bg=c["window"])
+        self.scale_options(self.body.configure, padx=15, pady=11)
         self.body_window = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
         self.canvas.bind("<Configure>", self.resize_body)
         self.body.bind("<Configure>", self.fit_scroll)
@@ -185,7 +255,8 @@ class Popup:
 
         self.question_row = tk.Frame(self.body, bg=c["window"])
         self.question = self.label(self.question_row, size=10, bg="tint", justify="left",
-                                   anchor="w", wraplength=self.dp(400), padx=self.dp(9), pady=self.dp(5))
+                                   anchor="w", wraplength=self.dp(400))
+        self.scale_options(self.question.configure, padx=9, pady=5)
         self.question.pack(side="right")
         bar = tk.Frame(self.body, bg=c["window"])
         bar.pack(fill="x")
@@ -196,57 +267,83 @@ class Popup:
         self.status.pack(side="right")
         self.copy_button = self.button(bar, "复制", self.copy_answer, "window", size=9)
         self.reason_button = self.button(bar, "查看思考", self.toggle_thought, "window", size=9)
+        for button in (self.copy_button, self.reason_button):
+            self.scale_options(button.configure, padx=7, pady=3)
 
         self.reason_text = self.label(self.body, size=10, color="muted", bg="soft", justify="left",
-                                      wraplength=self.dp(449), anchor="w", padx=self.dp(9), pady=self.dp(5))
+                                      wraplength=self.dp(449), anchor="w")
+        self.scale_options(self.reason_text.configure, padx=9, pady=5)
         self.answer_view = AnswerView(self.body, c, self.scale)
         self.answer_view.bind("<MouseWheel>", self.scroll_answer_from_text, add="+")
         self.empty = self.label(self.body, "回答会显示在这里", 10, "muted")
         self.empty.pack(pady=(self.dp(34), self.dp(6)))
 
-        self.notice = tk.Frame(frame, bg=c["soft"], padx=self.dp(12), pady=self.dp(6))
+        self.notice = tk.Frame(frame, bg=c["soft"])
+        self.scale_options(self.notice.configure, padx=12, pady=6)
         self.notice_label = self.label(self.notice, size=9, bg="soft", justify="left",
-                                       anchor="w", wraplength=self.dp(460))
+                                       anchor="w")
+        self.scale_options(self.notice_label.configure, wraplength=460)
         self.notice_label.pack(anchor="w")
         self.notice_actions = tk.Frame(self.notice, bg=c["soft"])
         self.notice_actions.pack(anchor="w")
 
         self.footer = tk.Frame(frame, bg=c["chrome"])
         self.footer.pack(fill="x", side="bottom", before=center)
-        tk.Frame(self.footer, bg=c["line"], height=self.dp(1)).pack(fill="x")
-        composer = tk.Frame(self.footer, bg=c["chrome"], padx=self.dp(8), pady=self.dp(5))
-        composer.pack(fill="x", padx=self.dp(11), pady=self.dp(8))
+        divider = tk.Frame(self.footer, bg=c["line"])
+        divider.pack(fill="x")
+        self.scale_options(divider.configure, height=1)
+        composer = tk.Frame(self.footer, bg=c["chrome"])
+        self.scale_options(composer.configure, padx=8, pady=5)
+        composer.pack(fill="x")
+        self.scale_options(composer.pack_configure, padx=11, pady=8)
         composer.grid_columnconfigure(0, weight=1)
         self.input_shell = tk.Canvas(composer, background=c["chrome"], borderwidth=0, highlightthickness=0)
         self.input_shell.place(relwidth=1, relheight=1, bordermode="outside")
         self.input_shell.bind("<Configure>", self.paint_input_shell)
+        self.attachment = tk.Frame(composer, bg=c["input"])
+        self.attachment.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.attachment.grid_remove()
+        self.attachment_thumb = self.label(self.attachment, bg="input")
+        self.attachment_thumb.pack(side="left")
+        self.scale_options(self.attachment_thumb.pack_configure, padx=(3, 6))
+        self.attachment_label = self.label(self.attachment, size=9, color="muted", bg="input")
+        self.attachment_label.pack(side="left")
+        remove = self.button(self.attachment, "移除", self.remove_draft_image, "input", size=9)
+        remove.pack(side="right")
+        self.scale_options(remove.configure, padx=7, pady=3)
         self.input = tk.Text(composer, height=1, width=1, wrap="word", bg=c["input"], fg=c["ink"],
                              insertbackground=c["accent"], font=self.font(INPUT_FONT_SIZE),
-                             undo=True, relief="flat", bd=0, padx=self.dp(3), pady=self.dp(3))
-        self.input.grid(row=0, column=0, sticky="ew", padx=(0, self.dp(5)))
+                             undo=True, relief="flat", bd=0)
+        self.scale_options(self.input.configure, padx=3, pady=3)
+        self.input.grid(row=1, column=0, sticky="ew")
+        self.scale_options(self.input.grid_configure, padx=(0, 5))
         self.placeholder = self.label(self.input, "输入问题…", INPUT_FONT_SIZE, "muted", "input", anchor="w")
         self.placeholder.bind("<Button-1>", lambda event: self.input.focus_set())
         self.input.bind("<<Modified>>", self.update_input)
+        self.input.bind("<<Paste>>", self.paste_image)
         self.input.bind("<Return>", self.on_enter)
         self.input.bind("<Shift-Return>", lambda event: None)
         self.input.bind("<FocusIn>", self.input_focused)
         self.input.bind("<FocusOut>", lambda event: r.after_idle(self.paint_input_shell))
         self.send_button = IconButton(composer, "send", self.submit, c, self.scale, "input")
-        self.send_button.grid(row=0, column=1, sticky="s")
+        self.send_button.grid(row=1, column=1, sticky="s")
         self.stop_button = IconButton(composer, "stop", self.stop, c, self.scale, "input")
-        self.stop_button.grid(row=0, column=1, sticky="s")
+        self.stop_button.grid(row=1, column=1, sticky="s")
         self.stop_button.grid_remove()
         self.update_input()
+        self.setup_panel = SetupView(center, self)
 
         self.menu = tk.Menu(r, tearoff=False)
         self.menu.add_command(label="打开弹窗", command=self.show)
-        self.menu.add_command(label="打开 Edge 扩展设置", command=self.open_setup)
+        self.menu.add_command(label="打开当前会话", command=self.open_login)
+        self.menu.add_command(label="连接或切换账号", command=self.refresh_login)
         self.menu.add_separator()
         self.menu.add_command(label="退出", command=self.exit)
 
-    def resize_body(self, event):
-        self.canvas.itemconfigure(self.body_window, width=event.width)
-        wrap = max(self.dp(210), event.width - self.dp(34))
+    def resize_body(self, event=None):
+        width = event.width if event else self.canvas.winfo_width()
+        self.canvas.itemconfigure(self.body_window, width=width)
+        wrap = max(self.dp(210), width - self.dp(34))
         self.reason_text.configure(wraplength=wrap - self.dp(20))
         self.question.configure(wraplength=wrap - self.dp(42))
 
@@ -287,13 +384,51 @@ class Popup:
 
     def drag(self, event):
         x, y = self.drag_offset
-        self.root.geometry(f"{event.x_root - x:+d}{event.y_root - y:+d}")
+        self.root.geometry(f"+{event.x_root - x}+{event.y_root - y}")
+
+    def end_drag(self, event):
+        self.place_on_pointer_monitor(keep_position=True)
+
+    def place_on_pointer_monitor(self, keep_position=False):
+        root = self.root
+        area = monitor_work_area(*root.winfo_pointerxy())
+        if area is None:
+            return
+        work_left, work_top, work_right, work_bottom = area
+        root.update_idletasks()
+        left, top = root.winfo_rootx(), root.winfo_rooty()
+        width, height = root.winfo_width(), root.winfo_height()
+        same_monitor = (self.positioned and work_left <= left + width // 2 < work_right
+                        and work_top <= top + height // 2 < work_bottom)
+        work_width, work_height = work_right - work_left, work_bottom - work_top
+        if not same_monitor:
+            # Windows updates the HWND's DPI as it moves, including while withdrawn.
+            probe_width, probe_height = min(width, work_width), min(height, work_height)
+            x = work_left + (work_width - probe_width) // 2
+            y = work_top + (work_height - probe_height) // 2
+            root.geometry(f"{probe_width}x{probe_height}+{x}+{y}")
+            root.update_idletasks()
+        scale = window_dpi(root.winfo_id()) / 96
+        width = min(round(width * scale / self.scale), work_width)
+        height = min(round(height * scale / self.scale), work_height)
+        self.set_scale(scale)
+        if same_monitor or keep_position:
+            left = min(max(left, work_left), work_right - width)
+            top = min(max(top, work_top), work_bottom - height)
+        else:
+            left = work_left + (work_width - width) // 2
+            top = work_top + (work_height - height) // 2
+        # Tk's '+' position marker keeps a negative screen coordinate absolute.
+        root.geometry(f"{width}x{height}+{left}+{top}")
+        self.positioned = True
 
     def show(self):
+        self.place_on_pointer_monitor()
         self.focus_grace = time.monotonic() + .3
         self.root.deiconify()
         self.root.lift()
-        self.root.after_idle(self.input.focus_force)
+        target = self.setup_panel.picker if self.setup_panel.winfo_manager() else self.input
+        self.root.after_idle(target.focus_force)
 
     def hide(self, event=None):
         self.resize.cancel()
@@ -334,12 +469,12 @@ class Popup:
     def exit(self):
         if not self.demo:
             record("desktop.exit", self.active)
-        if self.active and self.bridge:
-            self.cancel_browser_request()
+        if self.active and self.client:
+            self.cancel_request()
         if self.windows:
             self.windows.close()
-        if self.bridge:
-            self.bridge.close()
+        if self.client:
+            self.client.close()
         self.root.destroy()
 
     def set_notice(self, text="", actions=()):
@@ -355,39 +490,115 @@ class Popup:
             button.pack(side="left", padx=(0, self.dp(6)), pady=(self.dp(5), 0))
         self.notice.pack(fill="x", side="bottom", after=self.footer)
 
-    def show_setup(self):
-        self.set_notice("等待 Edge 连接。首次使用请加载配套扩展，再粘贴连接码。",
-                        (("打开扩展设置", self.open_setup), ("复制连接码", self.copy_code),
-                         ("打开连接页", self.open_pair)))
+    def show_setup(self, message=""):
+        self.close_settings()
+        self.set_notice()
+        preferred = self.client.account.get("edge_profile", "Default") if self.client else None
+        self.setup_panel.show(preferred, can_return=self.client is not None, message=message)
+        self.footer.pack_forget()
 
-    def copy_code(self):
-        if self.bridge:
-            self.root.clipboard_clear()
-            self.root.clipboard_append(self.bridge.token)
-            self.open_pair()
+    def refresh_login(self):
+        if self.active:
+            self.set_notice("请先结束当前请求，再连接其他账号。")
+            return
+        self.show_setup()
 
-    def open_setup(self):
-        self.open_page("edge://extensions/")
+    def close_setup(self):
+        self.setup_panel.grid_remove()
+        self.footer.pack(fill="x", side="bottom", before=self.center)
+        self.root.after_idle(self.input.focus_set)
 
-    def open_pair(self):
-        self.open_page(ORIGIN + "/pair.html")
+    def import_login(self):
+        if self.setup_panel.busy or self.active:
+            return
+        profile = self.setup_panel.profile()
+        self.setup_panel.set_busy(True)
+        threading.Thread(target=self.read_login, args=(profile,), daemon=True).start()
 
-    def open_page(self, url):
+    def read_login(self, profile):
         try:
-            open_edge(url)
+            account = import_edge_login(profile)
+            client = WebClient(account=account)
+            client.connect_account()
+        except (OSError, ValueError, WebError) as error:
+            record("web.account_import_failed", error=type(error).__name__)
+            if isinstance(error, (ValueError, WebError)):
+                text = str(error)
+            else:
+                text = "无法读取或保存登录，请确认 Edge 已完成登录，稍后再试。"
+            self.setup_results.put((None, text))
+        except Exception as error:
+            record("web.account_import_failed", error=type(error).__name__)
+            self.setup_results.put((None, "读取登录时发生错误，请重新登录后再试。"))
+        else:
+            self.setup_results.put((client, ""))
+
+    def open_page(self, url, profile=None):
+        try:
+            open_edge(url, profile)
             self.root.withdraw()
         except OSError:
-            self.set_notice("无法启动 Microsoft Edge。请手动打开浏览器。")
+            text = "未找到可用的 Microsoft Edge，请先安装 Edge 后重试。"
+            if self.setup_panel.winfo_manager():
+                self.setup_panel.show_error(text)
+            else:
+                self.set_notice(text)
 
     def open_login(self):
-        self.root.withdraw()
-        if self.bridge and self.bridge.connected:
-            self.bridge.jobs.put({"type": "open"})
+        url = "https://chat.deepseek.com/"
+        if self.setup_panel.winfo_manager():
+            profile = self.setup_panel.profile()
         else:
-            self.open_page("https://chat.deepseek.com/")
+            profile = self.client.account.get("edge_profile") if self.client else None
+        if self.client and not self.setup_panel.winfo_manager():
+            url += "a/chat/s/" + self.client.account["session_id"]
+        self.open_page(url, profile)
 
     def read_input(self):
         return self.input.get("1.0", "end-1c")
+
+    @staticmethod
+    def thumbnail(source, size):
+        sample = (max(source.width(), source.height()) + size - 1) // size
+        return source.subsample(sample) if sample > 1 else source
+
+    def paste_image(self, event=None):
+        try:
+            image = read_clipboard_image(self.root.winfo_id())
+            if image is None:
+                return None
+            source = tk.PhotoImage(master=self.root, data=b64encode(image.png), format="png")
+        except ClipboardImageError as error:
+            self.set_notice(str(error))
+            return "break"
+        except tk.TclError:
+            self.set_notice("无法打开剪贴板图片，请重新复制。")
+            return "break"
+        self.set_draft_image(image, self.thumbnail(source, 192))
+        if self.ready:
+            self.set_notice()
+        return "break"
+
+    def refresh_draft_preview(self):
+        source = self.draft_preview_source
+        self.draft_preview = self.thumbnail(source, self.dp(38)) if source else None
+        self.attachment_thumb.configure(image=self.draft_preview or "")
+        if self.attachment.winfo_manager():
+            self.attachment.grid_configure(pady=(0, self.dp(3)))
+
+    def set_draft_image(self, image, preview_source=None):
+        self.draft_image, self.draft_preview_source = image, preview_source
+        if image:
+            self.attachment_label.configure(text=f"图片 · {image.width} × {image.height}")
+            self.attachment.grid()
+        else:
+            self.attachment.grid_remove()
+        self.refresh_draft_preview()
+        self.update_input()
+
+    def remove_draft_image(self):
+        self.set_draft_image(None)
+        self.input.focus_set()
 
     def update_input(self, event=None):
         self.input.edit_modified(False)
@@ -395,12 +606,11 @@ class Popup:
         self.input.configure(height=min(3, 1 + value.count("\n")))
         if value or (self.ime and self.ime.composing):
             self.placeholder.place_forget()
-            self.send_button.set_enabled(bool(value.strip()))
         else:
             self.placeholder.configure(text="输入下一个问题…" if self.question_row.winfo_manager()
                                        else "输入问题…")
             self.placeholder.place(x=self.dp(3), y=self.dp(3))
-            self.send_button.set_enabled(False)
+        self.send_button.set_enabled(bool(value.strip() or self.draft_image))
 
     def replace_input(self, text):
         self.input.delete("1.0", "end")
@@ -456,28 +666,32 @@ class Popup:
 
     def submit(self):
         text = self.read_input().strip()
-        if self.active or not text:
+        image = self.draft_image
+        if self.active or not (text or image):
             return
         if len(text) > PROMPT_LIMIT:
             self.set_notice(f"单次最多可发送 {PROMPT_LIMIT} 个字符，请缩短后重试。")
             return
         if not self.ready:
-            record("desktop.submit_blocked", reason="bridge_unavailable")
-            if self.bridge:
-                self.show_setup()
+            record("desktop.submit_blocked", reason="login_unavailable")
+            self.show_setup()
             return
         self.active = uuid.uuid4().hex
         self.pending_prompt = text
+        self.pending_image = image
+        self.question_preview = self.draft_preview
+        self.question_preview_source = self.draft_preview_source
         self.started = self.needs_login = self.first_delta = False
         self.request_started = time.monotonic()
         self.deadline = self.request_started + 325
         self.reset()
         self.set_notice()
-        self.question.configure(text=text)
+        self.question.configure(text=text or "图片", image=self.question_preview or "", compound="left")
         self.question_row.pack(fill="x", pady=(0, self.dp(8)), before=self.answer_bar)
+        self.set_draft_image(None)
         self.replace_input("")
-        self.status.configure(text="●  已发送")
-        self.empty.configure(text="等待 DeepSeek 回复…")
+        self.status.configure(text="●  已发送" if self.demo else "●  正在连接")
+        self.empty.configure(text="等待 DeepSeek 回复…" if self.demo else "正在连接 DeepSeek…")
         self.send_button.grid_remove()
         self.stop_button.set_enabled(True)
         self.stop_button.grid()
@@ -485,10 +699,15 @@ class Popup:
         if self.demo:
             self.run_demo(self.active)
         else:
-            record("desktop.queued", self.active, search=self.search_on.get(), thinking=self.thinking_on.get())
-            self.bridge.active_request = self.active
-            self.bridge.jobs.put(dict(type="ask", id=self.active, day=date.today().isoformat(),
-                                      prompt=text, search=self.search_on.get(), thinking=self.thinking_on.get()))
+            search = self.search_on.get() and image is None
+            record("desktop.queued", self.active, search=search, thinking=self.thinking_on.get(), image=image is not None)
+            self.client.active_request = self.active
+            job = dict(type="ask", id=self.active,
+                       prompt=text, search=search, thinking=self.thinking_on.get())
+            if image is not None:
+                job.update(type="ask_image", prompt=text or "请说明这张图片的内容。",
+                           image=b64encode(image.png).decode("ascii"))
+            self.client.enqueue(job)
 
     def run_demo(self, request):
         sample = "这是流式输出示例。DeepSeek 正文会在这里逐段显示。"
@@ -521,12 +740,12 @@ class Popup:
             self.stop_requested = True
             self.stop_button.set_enabled(False)
             self.status.configure(text="正在停止…")
-            self.cancel_browser_request()
+            self.cancel_request()
             self.root.after(STOP_TIMEOUT_MS, self.stop_timed_out, self.active)
 
-    def cancel_browser_request(self):
-        self.bridge.active_request = None
-        self.bridge.jobs.put({"type": "stop", "id": self.active})
+    def cancel_request(self):
+        self.client.active_request = None
+        self.client.enqueue({"type": "stop", "id": self.active})
 
     def stop_timed_out(self, request):
         if self.active == request and self.stop_requested:
@@ -535,7 +754,7 @@ class Popup:
     def finish_unconfirmed_stop(self, stage):
         self.record_request(stage)
         self.finish("已停止等待")
-        self.set_notice("未收到网页的停止确认。可以打开 Edge 查看生成状态。", (("打开 Edge 查看", self.open_login),))
+        self.set_notice("已停止等待，服务端停止状态尚未确认。", (("查看当前会话", self.open_login),))
 
     def delta(self, answer, thought, search):
         self.answer, self.thought = answer, thought
@@ -555,11 +774,12 @@ class Popup:
         self.paint_thought()
 
     def finish(self, status):
-        if self.bridge:
-            self.bridge.active_request = None
+        if self.client:
+            self.client.active_request = None
         self.active = None
         self.stop_requested = False
         self.pending_prompt = ""
+        self.pending_image = None
         self.status.configure(text=status)
         if self.empty.winfo_manager():
             self.empty.configure(text=status.strip("● "))
@@ -572,12 +792,15 @@ class Popup:
 
     def fail(self, description, login=False):
         prompt = self.pending_prompt
+        image = self.pending_image
         restore = login or not self.started
         self.needs_login = login
         self.finish("需要登录" if login else "请求中断")
-        if restore and prompt and not self.read_input().strip():
+        if restore and (prompt or image) and not self.read_input().strip() and self.draft_image is None:
             self.replace_input(prompt)
-        self.set_notice(description, (("去 Edge 登录", self.open_login),) if login else ())
+            if image:
+                self.set_draft_image(image, self.question_preview_source)
+        self.set_notice(description, (("去 Edge 登录", self.open_login), ("重新读取登录", self.refresh_login)) if login else ())
 
     def record_request(self, stage, **fields):
         elapsed_ms = round((time.monotonic() - self.request_started) * 1000)
@@ -587,9 +810,17 @@ class Popup:
         if event.get("id") != self.active or not self.active:
             return
         kind = event.get("type")
-        if kind == "started":
+        if kind == "progress":
+            if not self.started and not self.stop_requested:
+                self.status.configure(text="●  " + event["text"])
+                self.empty.configure(text=event["text"] + "…")
+        elif kind == "started":
             self.started = True
+            if not self.first_delta and not self.stop_requested:
+                self.status.configure(text="●  已发送")
+                self.empty.configure(text="等待 DeepSeek 回复…")
         elif kind == "delta":
+            self.started = True
             answer = str(event.get("answer", ""))
             if not self.first_delta:
                 self.first_delta = True
@@ -614,40 +845,50 @@ class Popup:
             self.fail(str(event.get("text") or "网页请求失败，请在 Edge 查看。"), login=kind == "login")
 
     def tick(self):
+        while True:
+            try:
+                client, error = self.setup_results.get_nowait()
+            except Empty:
+                break
+            self.setup_panel.set_busy(False)
+            if error:
+                self.setup_panel.show_error(error)
+            else:
+                self.client = client
+                self.ready = True
+                self.needs_login = False
+                self.set_notice()
+                self.close_setup()
         if self.windows:
             self.windows.poll()
             if (self.root.state() != "withdrawn" and time.monotonic() >= self.focus_grace
                     and not self.windows.foreground()):
                 self.hide()
         self.input_composing()
-        if self.bridge:
-            connected = self.bridge.connected
+        if self.client:
+            connected = self.client.connected
             if self.ready != connected:
                 self.ready = connected
-                record("desktop.edge_connected" if connected else "desktop.edge_disconnected", self.active)
+                record("desktop.web_available" if connected else "desktop.web_unavailable", self.active)
                 if connected and not self.needs_login:
                     self.set_notice()
                 elif not connected and not self.active and not self.needs_login:
                     self.show_setup()
             while True:
                 try:
-                    self.accept(self.bridge.events.get_nowait())
+                    self.accept(self.client.events.get_nowait())
                 except Empty:
                     break
             now = time.monotonic()
             if self.active and not self.stop_requested and now >= self.deadline:
                 self.record_request("reply_timeout", started=self.started, received_delta=self.first_delta)
-                self.cancel_browser_request()
-                self.fail("等待网页回答超时，请在 Edge 查看。")
-            elif self.active and not self.stop_requested and not connected:
-                self.record_request("request_lost_connection", started=self.started, received_delta=self.first_delta)
-                self.cancel_browser_request()
-                self.fail("与 Edge 的连接中断，请确认扩展和浏览器仍在运行。")
+                self.cancel_request()
+                self.fail("等待 DeepSeek 回复超时，已保留收到的内容。")
             elif (self.active and not self.stop_requested and not (self.started or self.first_delta)
-                  and now - self.request_started >= REQUEST_START_TIMEOUT):
+                  and now - self.request_started >= (IMAGE_START_TIMEOUT if self.pending_image else REQUEST_START_TIMEOUT)):
                 self.record_request("start_timeout")
-                self.cancel_browser_request()
-                self.fail("未收到 DeepSeek 网页开始回复的信号，请在 Edge 查看页面状态。")
+                self.cancel_request()
+                self.fail("图片上传或发送超时，请稍后重试。" if self.pending_image else "连接 DeepSeek 超时，请稍后重试。")
         self.root.after(75, self.tick)
 
 
@@ -672,8 +913,7 @@ def main():
         record("desktop.started", background=background)
     try:
         root = tk.Tk()
-        if background:
-            root.withdraw()
+        root.withdraw()
         popup = Popup(root, demo=demo or smoke, smoke=smoke)
         if smoke:
             popup.exit()

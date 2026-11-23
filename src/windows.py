@@ -18,6 +18,7 @@ WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 IMAGE_ICON = 1
 LR_LOADFROMFILE = 0x0010
+MONITOR_DEFAULTTONEAREST = 2
 APP_ASSETS = Path(__file__).resolve().parents[1] / "assets"
 
 
@@ -49,11 +50,19 @@ class WindowClass(ct.Structure):
     ]
 
 
+class MonitorInfo(ct.Structure):
+    _fields_ = [("size", w.DWORD), ("monitor", w.RECT), ("work", w.RECT), ("flags", w.DWORD)]
+
+
 user.GetAncestor.argtypes = (w.HWND, w.UINT)
 user.GetAncestor.restype = w.HWND
 user.GetForegroundWindow.restype = w.HWND
 user.GetDpiForWindow.argtypes = (w.HWND,)
 user.GetDpiForWindow.restype = w.UINT
+user.MonitorFromPoint.argtypes = (w.POINT, w.DWORD)
+user.MonitorFromPoint.restype = w.HANDLE
+user.GetMonitorInfoW.argtypes = (w.HANDLE, ct.POINTER(MonitorInfo))
+user.GetMonitorInfoW.restype = w.BOOL
 user.GetWindowThreadProcessId.argtypes = (w.HWND, ct.POINTER(w.DWORD))
 user.RegisterHotKey.argtypes = (w.HWND, ct.c_int, w.UINT, w.UINT)
 user.UnregisterHotKey.argtypes = (w.HWND, ct.c_int)
@@ -106,15 +115,38 @@ def enable_high_dpi():
         set_thread(context)
 
 
+def monitor_work_area(x, y):
+    monitor = user.MonitorFromPoint(w.POINT(x, y), MONITOR_DEFAULTTONEAREST)
+    info = MonitorInfo(ct.sizeof(MonitorInfo))
+    if monitor and user.GetMonitorInfoW(monitor, ct.byref(info)):
+        area = info.work
+        return area.left, area.top, area.right, area.bottom
+    return None
+
+
+def window_dpi(hwnd):
+    return user.GetDpiForWindow(hwnd) or 96
+
+
 def single_instance():
     handle = application.CreateMutexW(None, False, r"Local\DesktopAI.DeepSeek")
     return handle, ct.get_last_error() != 183
 
 
-def open_edge(url):
-    base = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
-    edge = base / "Microsoft" / "Edge" / "Application" / "msedge.exe"
-    subprocess.Popen([str(edge), url])
+def open_edge(url, profile=None):
+    candidates = [
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")),
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")),
+        Path(os.environ["LOCALAPPDATA"]),
+    ]
+    edge = next((base / "Microsoft/Edge/Application/msedge.exe" for base in candidates
+                 if (base / "Microsoft/Edge/Application/msedge.exe").is_file()), None)
+    if edge is None:
+        raise FileNotFoundError("未找到 Microsoft Edge，请先安装 Edge 后重试。")
+    command = [str(edge)]
+    if profile:
+        command.append("--profile-directory=" + profile)
+    subprocess.Popen([*command, url])
 
 
 class InputMethod:
@@ -124,8 +156,7 @@ class InputMethod:
         self.composing = False
 
     def font(self, hwnd):
-        dpi = user.GetDpiForWindow(hwnd) or 96
-        return LogFont(height=-round(self.font_size * dpi / 72), weight=400,
+        return LogFont(height=-round(self.font_size * window_dpi(hwnd) / 72), weight=400,
                        charset=1, quality=5, face=self.family)
 
     def apply(self):
@@ -202,7 +233,7 @@ class NativeEvents:
         )
         try:
             self.tray_added = bool(hwnd and shell.Shell_NotifyIconW(0, ct.byref(tray)))
-            self.registered = bool(user.RegisterHotKey(None, HOTKEY, 0x4006, ord("Y")))
+            self.registered = bool(user.RegisterHotKey(None, HOTKEY, 0x4006, ord("I")))
             self.ready.set()
             while user.GetMessageW(ct.byref(message), None, 0, 0) > 0:
                 if message.message == WM_HOTKEY and message.wParam == HOTKEY:
