@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 from queue import Empty, Queue
+import re
 import sys
 import time
 import threading
@@ -13,14 +14,19 @@ import winreg
 
 from web_account import import_edge_login
 from web_client import WebClient, WebError
+from chatgpt_account import ChatGPTError
+from chatgpt_web_account import import_session, update_registration
+from chatgpt_web_client import ChatGPTWebClient as ChatGPTClient
 from setup_view import SetupView
 from answer_view import AnswerView
 from clipboard_image import ClipboardImageError, read_clipboard_image
-from controls import FONT_FAMILY, IconButton, SettingsPanel, WindowResize, font_pixels, rounded
+from controls import FONT_FAMILY, IconButton, WindowResize, font_pixels, rounded
+from ui_controls import ActionButton
+from window_layout import choose_monitor, clamp_rect, remember_rect, restore_rect
 from diagnostics import record, record_callback_error, start_logging
 from windows import (
-    APP_ASSETS, InputMethod, Integration, application, enable_high_dpi, monitor_work_area,
-    open_edge, single_instance, window_dpi,
+    APP_ASSETS, InputMethod, Integration, application, enable_high_dpi, monitor_work_area, monitor_at, monitors,
+    open_chrome, open_edge, single_instance, window_dpi,
 )
 
 
@@ -55,10 +61,21 @@ class Popup:
         self.colors = palette()
         self.settings_file = None if demo else Path(os.environ["LOCALAPPDATA"]) / "DesktopAI" / "settings.json"
         settings = self.load_settings()
+        self.provider = "chatgpt" if settings.get("provider") == "chatgpt" else "deepseek"
+        self.chatgpt_model = settings.get("chatgpt_model")
+        self.pinned_device = settings.get('pinned_monitor') if isinstance(settings.get('pinned_monitor'), str) else None
+        geometry = settings.get('pinned_geometry')
+        self.pin_geometry = geometry if isinstance(geometry, dict) and all(
+            isinstance(geometry.get(key), (int, float)) and abs(geometry[key]) < 100000 for key in ('x', 'y', 'width', 'height')) and geometry['width'] >= 200 and geometry['height'] >= 160 else None
+        self.fullscreen = False
+        self.normal_layout = self.fullscreen_device = self.settings_home = None
+        self._placing = False
+        self._pin_save_timer = None
         self.search_on = tk.BooleanVar(root, settings.get("search", True) is not False)
         self.thinking_on = tk.BooleanVar(root, settings.get("thinking", False) is True)
         self.client = self.windows = None
         self.setup_results = Queue()
+        self.setup_task = self.authorization = None
         self.ime = None
         self.active = None
         self.pending_prompt = ""
@@ -79,18 +96,22 @@ class Popup:
         self.drag_offset = (0, 0)
         self.build()
         self.resize = WindowResize(root, self.scale)
+        self.resize.constrain = self.constrain_resize
+        root.bind('<Configure>', self.window_configured, add='+')
         root.update_idletasks()
         self.ime = InputMethod(root, self.input, INPUT_FONT_SIZE, FONT_FAMILY)
         if not demo:
             root.report_callback_exception = lambda kind, _value, stack: record_callback_error(kind, stack, self.active)
             try:
-                self.client = WebClient()
+                self.client = ChatGPTClient(model=self.chatgpt_model) if self.provider == "chatgpt" else WebClient()
                 self.ready = True
             except FileNotFoundError:
                 self.show_setup()
             except (OSError, ValueError) as error:
                 record("web.start_failed", error=type(error).__name__)
-                self.show_setup("本机登录数据无法读取，请重新导入。")
+                self.show_setup("本机登录数据无法读取，请重新连接。")
+            self.update_provider_ui()
+            self.prepare_client()
         if not smoke:
             self.windows = Integration(root, self.show, self.show_menu)
             if not self.windows.hotkey:
@@ -122,7 +143,7 @@ class Popup:
             face.configure(size=font_pixels(size, scale))
         for configure, options in self.layout_options:
             self.apply_scaled_options(configure, options)
-        for widget in (self.settings_button, self.settings, self.send_button, self.stop_button,
+        for widget in (self.settings_button, self.pin_button, self.fullscreen_button, self.model_button, self.send_button, self.stop_button,
                        self.answer_view, self.resize, self.setup_panel):
             widget.set_scale(scale)
         for widget, padding in ((self.empty, (34, 6)), (self.question_row, (0, 8)),
@@ -134,8 +155,6 @@ class Popup:
             button.pack_configure(padx=(0, self.dp(6)), pady=(self.dp(5), 0))
         if self.placeholder.winfo_manager():
             self.placeholder.place_configure(x=self.dp(3), y=self.dp(3))
-        if self.settings.winfo_manager():
-            self.settings.place_configure(x=-self.dp(12), y=self.dp(44))
         if self.header_source:
             self.header_icon = self.thumbnail(self.header_source, self.dp(24))
             self.header_mark.configure(image=self.header_icon)
@@ -147,6 +166,7 @@ class Popup:
         self.resize_body()
         self.root.after_idle(self.paint_input_shell)
         self.root.after_idle(self.ime.apply)
+        self.root.after_idle(self.fit_setup)
 
     def load_settings(self):
         if self.settings_file:
@@ -161,7 +181,9 @@ class Popup:
     def save_settings(self):
         if not self.settings_file:
             return
-        settings = {"search": self.search_on.get(), "thinking": self.thinking_on.get()}
+        settings = {"search": self.search_on.get(), "thinking": self.thinking_on.get(),
+                    "provider": self.provider, "chatgpt_model": self.chatgpt_model,
+                    'pinned_monitor': self.pinned_device, 'pinned_geometry': self.pin_geometry}
         path = self.settings_file
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -214,22 +236,29 @@ class Popup:
         self.header_mark = mark
         mark.pack(side="left")
         brand = self.label(title, "DeepSeek", 11, bg="chrome")
+        self.brand = brand
         brand.pack(side="left")
         self.scale_options(brand.pack_configure, padx=7)
-        self.settings_button = IconButton(title, "settings", self.toggle_settings, c, self.scale, "chrome")
+        self.settings_button = IconButton(title, "settings", self.toggle_settings, c, self.scale, "chrome", tooltip='设置')
         self.settings_button.pack(side="right")
+        self.fullscreen_button = IconButton(title, 'fullscreen', self.toggle_fullscreen, c, self.scale, 'chrome', tooltip='全屏')
+        self.fullscreen_button.pack(side='right')
+        self.pin_button = IconButton(title, 'pin', self.toggle_pin, c, self.scale, 'chrome', tooltip='固定当前屏幕')
+        self.pin_button.pack(side='right')
+        self.pin_button.set_flag('selected', bool(self.pinned_device))
+        self.model_button = ActionButton(title, '默认 ▾', self.toggle_settings, c, self.scale, width=90)
+        self.model_button.configure(bg=c['chrome'])
+        self.model_button.pack(side='left')
+        self.scale_options(self.model_button.pack_configure, padx=(5, 0))
         for widget in (title, mark, brand):
             widget.bind("<ButtonPress-1>", self.start_drag)
             widget.bind("<B1-Motion>", self.drag)
             widget.bind("<ButtonRelease-1>", self.end_drag)
+            widget.bind('<Double-Button-1>', lambda event: self.toggle_fullscreen())
         divider = tk.Frame(frame, bg=c["line"])
         divider.pack(fill="x")
         self.scale_options(divider.configure, height=1)
 
-        self.settings = SettingsPanel(frame, c, self.scale,
-                                      (("智能搜索", self.search_on), ("深度思考", self.thinking_on)),
-                                      self.save_settings)
-        r.bind("<ButtonPress-1>", self.dismiss_settings, add="+")
         center = self.center = tk.Frame(frame, bg=c["window"])
         center.pack(fill="both", expand=True)
         center.grid_columnconfigure(0, weight=1)
@@ -332,11 +361,12 @@ class Popup:
         self.stop_button.grid_remove()
         self.update_input()
         self.setup_panel = SetupView(center, self)
+        self.settings = self.setup_panel
 
         self.menu = tk.Menu(r, tearoff=False)
         self.menu.add_command(label="打开弹窗", command=self.show)
-        self.menu.add_command(label="打开当前会话", command=self.open_login)
-        self.menu.add_command(label="连接或切换账号", command=self.refresh_login)
+        self.menu.add_command(label="打开网页版", command=self.open_login)
+        self.menu.add_command(label="模型与账号", command=self.refresh_login)
         self.menu.add_separator()
         self.menu.add_command(label="退出", command=self.exit)
 
@@ -358,6 +388,8 @@ class Popup:
             self.canvas.yview_moveto(1)
 
     def scroll_answer(self, event):
+        if self.setup_panel.winfo_manager():
+            return self.setup_panel.scroll(event)
         if event.widget is not self.input and self.scrollbar.winfo_ismapped():
             self.canvas.yview_scroll(-int(event.delta / 120), "units")
 
@@ -380,58 +412,185 @@ class Popup:
             self.root.after_idle(self.ime.apply)
 
     def start_drag(self, event):
+        if self.fullscreen:
+            self.drag_offset = None
+            return 'break'
         self.drag_offset = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
 
     def drag(self, event):
+        if self.drag_offset is None or self.fullscreen:
+            return 'break'
         x, y = self.drag_offset
-        self.root.geometry(f"+{event.x_root - x}+{event.y_root - y}")
+        rect = (event.x_root-x, event.y_root-y, self.root.winfo_width(), self.root.winfo_height())
+        if self.pinned_device:
+            screen = self.target_monitor()
+            if screen:
+                rect = clamp_rect(rect, screen['work'])
+        self.put_rect(rect)
 
     def end_drag(self, event):
+        if self.fullscreen or self.drag_offset is None:
+            return
         self.place_on_pointer_monitor(keep_position=True)
+        self.remember_pin()
+
+    def window_rect(self):
+        size = re.match(r'(\d+)x(\d+)', self.root.geometry())
+        width, height = map(int, size.groups()) if size else (self.dp(510), self.dp(384))
+        return self.root.winfo_rootx(), self.root.winfo_rooty(), width, height
+
+    def put_rect(self, rect):
+        x, y, width, height = map(round, rect)
+        self.root.geometry(f'{width}x{height}+{x}+{y}')
+
+    def current_monitor(self):
+        x, y, width, height = self.window_rect()
+        return monitor_at(x+width/2, y+height/2)
+
+    def constrain_resize(self, rect):
+        if self.pinned_device:
+            screen = self.target_monitor()
+            if screen:
+                return clamp_rect(rect, screen['work'])
+        return rect
+
+    def target_monitor(self, keep_position=False):
+        x, y, width, height = self.window_rect()
+        point = (x+width/2, y+height/2) if keep_position else self.root.winfo_pointerxy()
+        return choose_monitor(monitors(), self.pinned_device, point)
+
+    def move_to_monitor(self, screen, saved=None, keep_position=False):
+        if not screen:
+            return
+        self._placing = True
+        try:
+            self.root.update_idletasks()
+            x, y, width, height = self.window_rect()
+            old_scale = self.scale
+            left, top, right, bottom = screen['work']
+            same = self.positioned and left <= x+width/2 < right and top <= y+height/2 < bottom
+            if not same:
+                probe_w, probe_h = min(width, right-left), min(height, bottom-top)
+                self.put_rect((left+(right-left-probe_w)//2, top+(bottom-top-probe_h)//2, probe_w, probe_h))
+                self.root.update_idletasks()
+            scale = window_dpi(self.root.winfo_id()) / 96
+            self.set_scale(scale)
+            if saved:
+                rect = restore_rect(saved, screen['work'], scale)
+            else:
+                width, height = round(width*scale/old_scale), round(height*scale/old_scale)
+                if not (same or keep_position):
+                    x, y = left+(right-left-width)//2, top+(bottom-top-height)//2
+                rect = clamp_rect((x, y, width, height), screen['work'])
+            self.put_rect(rect)
+            self.root.update_idletasks()
+            self.positioned = True
+        finally:
+            self._placing = False
 
     def place_on_pointer_monitor(self, keep_position=False):
-        root = self.root
-        area = monitor_work_area(*root.winfo_pointerxy())
-        if area is None:
-            return
-        work_left, work_top, work_right, work_bottom = area
-        root.update_idletasks()
-        left, top = root.winfo_rootx(), root.winfo_rooty()
-        width, height = root.winfo_width(), root.winfo_height()
-        same_monitor = (self.positioned and work_left <= left + width // 2 < work_right
-                        and work_top <= top + height // 2 < work_bottom)
-        work_width, work_height = work_right - work_left, work_bottom - work_top
-        if not same_monitor:
-            # Windows updates the HWND's DPI as it moves, including while withdrawn.
-            probe_width, probe_height = min(width, work_width), min(height, work_height)
-            x = work_left + (work_width - probe_width) // 2
-            y = work_top + (work_height - probe_height) // 2
-            root.geometry(f"{probe_width}x{probe_height}+{x}+{y}")
-            root.update_idletasks()
-        scale = window_dpi(root.winfo_id()) / 96
-        width = min(round(width * scale / self.scale), work_width)
-        height = min(round(height * scale / self.scale), work_height)
-        self.set_scale(scale)
-        if same_monitor or keep_position:
-            left = min(max(left, work_left), work_right - width)
-            top = min(max(top, work_top), work_bottom - height)
+        screen = self.target_monitor(keep_position)
+        if self.fullscreen:
+            self.apply_fullscreen(screen)
         else:
-            left = work_left + (work_width - width) // 2
-            top = work_top + (work_height - height) // 2
-        # Tk's '+' position marker keeps a negative screen coordinate absolute.
-        root.geometry(f"{width}x{height}+{left}+{top}")
-        self.positioned = True
+            saved = self.pin_geometry if self.pinned_device and not keep_position and not self.setup_panel.winfo_manager() else None
+            self.move_to_monitor(screen, saved, keep_position)
+
+    def toggle_pin(self):
+        screen = self.current_monitor()
+        self.pin_to_monitor(None if self.pinned_device else screen['id'] if screen else None)
+
+    def pin_to_monitor(self, device):
+        if not device:
+            self.pinned_device = None
+            self.pin_geometry = None
+        else:
+            screen = next((item for item in monitors() if item['id'] == device), None)
+            if not screen:
+                return
+            current = self.current_monitor()
+            if self.fullscreen:
+                saved = self.settings_home or self.normal_layout
+            elif self.settings_home:
+                saved = self.settings_home
+            else:
+                saved = remember_rect(self.window_rect(), current['work'], self.scale) if current else None
+            self.pinned_device = device
+            self.pin_geometry = dict(saved) if saved else None
+            if self.fullscreen:
+                self.apply_fullscreen(screen)
+            else:
+                self.move_to_monitor(screen, keep_position=bool(current and current['id'] == device))
+                if not self.setup_panel.winfo_manager():
+                    self.pin_geometry = remember_rect(self.window_rect(), screen['work'], self.scale)
+        self.pin_button.set_flag('selected', bool(device))
+        self.pin_button.tooltip = '取消固定' if device else '固定当前屏幕'
+        self.save_settings()
+
+    def remember_pin(self):
+        self._pin_save_timer = None
+        if not self.pinned_device or self.fullscreen or self._placing or self.setup_panel.winfo_manager():
+            return
+        screen = self.current_monitor()
+        if screen and screen['id'] == self.pinned_device:
+            self.pin_geometry = remember_rect(self.window_rect(), screen['work'], self.scale)
+            self.save_settings()
+
+    def window_configured(self, event):
+        if event.widget is not self.root or self._placing or not self.pinned_device or self.fullscreen:
+            return
+        if self._pin_save_timer:
+            self.root.after_cancel(self._pin_save_timer)
+        self._pin_save_timer = self.root.after(250, self.remember_pin)
+
+    def apply_fullscreen(self, screen):
+        if not screen:
+            return
+        self.move_to_monitor(screen)
+        self.fullscreen_device = screen['id']
+        left, top, right, bottom = screen['bounds']
+        self.put_rect((left, top, right-left, bottom-top))
+
+    def toggle_fullscreen(self):
+        screen = self.current_monitor() or self.target_monitor()
+        if not screen:
+            return
+        self.setup_panel.close_choices()
+        if not self.fullscreen:
+            self.normal_layout = remember_rect(self.window_rect(), screen['work'], self.scale)
+            self.fullscreen = True
+            self.resize.cancel()
+            self.resize.enabled = False
+            self.fullscreen_button.set_icon('restore', '退出全屏')
+            self.fullscreen_button.set_flag('selected', True)
+            self.apply_fullscreen(screen)
+        else:
+            self.fullscreen = False
+            self.resize.enabled = True
+            self.fullscreen_button.set_icon('fullscreen', '全屏')
+            self.fullscreen_button.set_flag('selected', False)
+            self.move_to_monitor(screen, self.normal_layout)
+            self.normal_layout = self.fullscreen_device = None
+            self.remember_pin()
+            if self.setup_panel.winfo_manager():
+                self.root.after_idle(self.fit_setup)
+
+    def prepare_client(self):
+        if not self.demo and self.provider == 'chatgpt' and self.client:
+            self.client.start_preparation()
 
     def show(self):
+        self.prepare_client()
         self.place_on_pointer_monitor()
         self.focus_grace = time.monotonic() + .3
         self.root.deiconify()
         self.root.lift()
-        target = self.setup_panel.picker if self.setup_panel.winfo_manager() else self.input
+        target = (self.setup_panel.back if self.setup_panel.busy else self.setup_panel.source_picker) if self.setup_panel.winfo_manager() else self.input
         self.root.after_idle(target.focus_force)
 
     def hide(self, event=None):
         self.resize.cancel()
+        self.answer_view.close_preview()
         self.close_settings()
         self.root.withdraw()
         return "break"
@@ -443,30 +602,32 @@ class Popup:
             self.close_settings()
             self.input.focus_set()
             return "break"
+        if self.fullscreen:
+            self.toggle_fullscreen()
+            return 'break'
         return self.hide()
 
     def close_settings(self):
-        self.settings.place_forget()
-        self.settings_button.set_flag("selected", False)
+        if hasattr(self, 'setup_panel') and self.setup_panel.winfo_manager():
+            self.close_setup()
 
     def toggle_settings(self):
-        if self.settings.winfo_manager():
+        if self.setup_panel.winfo_manager() and (self.client or self.demo):
             self.close_settings()
             self.input.focus_set()
         else:
-            self.settings.place(relx=1, x=-self.dp(12), y=self.dp(44), anchor="ne")
-            self.settings.tk.call("raise", str(self.settings))
-            self.settings_button.set_flag("selected", True)
-            self.settings.focus_set()
+            self.show_setup()
 
     def dismiss_settings(self, event):
-        if self.settings.winfo_manager() and event.widget not in (self.settings, self.settings_button):
-            self.close_settings()
+        pass
 
     def show_menu(self):
         self.menu.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
 
     def exit(self):
+        if self.authorization:
+            self.authorization.cancel()
+        self.setup_task = None
         if not self.demo:
             record("desktop.exit", self.active)
         if self.active and self.client:
@@ -475,6 +636,10 @@ class Popup:
             self.windows.close()
         if self.client:
             self.client.close()
+        for timer in self.root.tk.call("after", "info"):
+            # Each widget owns its registered Tcl callback. Cancel the timer
+            # here and let that widget remove its own command during destroy.
+            self.root.tk.call("after", "cancel", timer)
         self.root.destroy()
 
     def set_notice(self, text="", actions=()):
@@ -491,11 +656,74 @@ class Popup:
         self.notice.pack(fill="x", side="bottom", after=self.footer)
 
     def show_setup(self, message=""):
-        self.close_settings()
+        if not self.setup_panel.winfo_manager():
+            if self.fullscreen:
+                self.settings_home = dict(self.normal_layout) if self.normal_layout else None
+            else:
+                screen = self.current_monitor()
+                if screen:
+                    self.settings_home = remember_rect(self.window_rect(), screen['work'], self.scale)
         self.set_notice()
         preferred = self.client.account.get("edge_profile", "Default") if self.client else None
-        self.setup_panel.show(preferred, can_return=self.client is not None, message=message)
+        self.setup_panel.show(preferred, can_return=self.client is not None or self.demo, message=message, provider=self.provider)
+        self.settings_button.set_flag('selected', True)
+        if self.active:
+            self.setup_panel.connect.configure(state='disabled')
+            self.setup_panel.status.configure(text='回答结束后可切换模型，窗口和回答偏好可随时调整。')
         self.footer.pack_forget()
+        self.root.after_idle(self.fit_setup)
+
+    def fit_setup(self):
+        if not self.setup_panel.winfo_manager() or self.fullscreen or self._placing:
+            return
+        width = self.dp(390)
+        header = self.brand.master.winfo_reqheight() + self.dp(3)
+        height = self.setup_panel.winfo_reqheight() + header
+        self.resize.min_width = width
+        self.resize.min_height = height
+        geometry = re.match(r"(\d+)x(\d+)", self.root.geometry())
+        current_width, current_height = map(int, geometry.groups()) if geometry else (0, 0)
+        width = max(width, self.root.winfo_width(), current_width)
+        height = max(height, self.root.winfo_height(), current_height)
+        screen = self.current_monitor()
+        if screen:
+            x, y, width, height = clamp_rect((self.root.winfo_rootx(), self.root.winfo_rooty(), width, height), screen['work'])
+            self.resize.min_width = min(self.resize.min_width, screen['work'][2]-screen['work'][0])
+            self.resize.min_height = min(self.resize.min_height, screen['work'][3]-screen['work'][1])
+            if (x, y, width, height) != self.window_rect():
+                self.put_rect((x, y, width, height))
+        elif width != self.root.winfo_width() or height != self.root.winfo_height():
+            self.root.geometry(f"{width}x{height}")
+
+    @property
+    def provider_name(self):
+        return "ChatGPT" if self.provider == "chatgpt" else "DeepSeek"
+
+    def update_provider_ui(self):
+        self.brand.configure(text=self.provider_name)
+        name = '默认'
+        if self.provider == 'chatgpt' and self.client:
+            name = next((item.get('display_name') or item['slug'] for item in self.client.models if item['slug'] == self.client.model), self.client.model)
+        text = name+' ▾'
+        while name and self.font(10).measure(text) > self.dp(self.model_button.logical_width-16):
+            name = name[:-1]
+            text = name.rstrip()+'… ▾'
+        self.model_button.configure(text=text)
+
+    def new_chatgpt_session(self):
+        self.close_settings()
+        if self.active:
+            self.set_notice("请先结束当前请求，再开始新会话。")
+            return
+        if self.provider != "chatgpt" or not self.client:
+            return
+        try:
+            self.client.reset_session()
+        except (OSError, ValueError, ChatGPTError):
+            self.set_notice("本机会话未能重置，请稍后重试。")
+        else:
+            self.reset()
+            self.set_notice("已开始新的 ChatGPT 会话。")
 
     def refresh_login(self):
         if self.active:
@@ -504,18 +732,46 @@ class Popup:
         self.show_setup()
 
     def close_setup(self):
+        self.setup_panel.close_choices()
         self.setup_panel.grid_remove()
+        self.settings_button.set_flag('selected', False)
+        self.resize.set_scale(self.scale)
         self.footer.pack(fill="x", side="bottom", before=self.center)
+        if self.settings_home:
+            if self.fullscreen:
+                self.normal_layout = dict(self.settings_home)
+            else:
+                screen = self.current_monitor()
+                if screen:
+                    self.move_to_monitor(screen, self.pin_geometry if self.pinned_device and self.pin_geometry else self.settings_home)
+        self.settings_home = None
         self.root.after_idle(self.input.focus_set)
+
+    def cancel_setup_login(self):
+        if self.authorization:
+            self.authorization.cancel()
+            self.authorization = None
+        self.setup_task = None
+        self.setup_panel.set_busy(False)
+        if self.client or self.demo:
+            self.close_setup()
+        else:
+            self.hide()
 
     def import_login(self):
         if self.setup_panel.busy or self.active:
             return
         profile = self.setup_panel.profile()
+        if (self.client and self.provider == 'deepseek' and not self.setup_panel.login_visible
+                and self.client.account.get('edge_profile', 'Default') == profile):
+            self.close_setup()
+            return
+        task = self.setup_task = uuid.uuid4().hex
         self.setup_panel.set_busy(True)
-        threading.Thread(target=self.read_login, args=(profile,), daemon=True).start()
+        threading.Thread(target=self.read_login, args=(profile, task), daemon=True).start()
 
-    def read_login(self, profile):
+    def read_login(self, profile, task):
+        client = None
         try:
             account = import_edge_login(profile)
             client = WebClient(account=account)
@@ -526,12 +782,80 @@ class Popup:
                 text = str(error)
             else:
                 text = "无法读取或保存登录，请确认 Edge 已完成登录，稍后再试。"
-            self.setup_results.put((None, text))
+            if client:
+                client.close()
+            self.setup_results.put((task, None, text))
         except Exception as error:
             record("web.account_import_failed", error=type(error).__name__)
-            self.setup_results.put((None, "读取登录时发生错误，请重新登录后再试。"))
+            if client:
+                client.close()
+            self.setup_results.put((task, None, "读取登录时发生错误，请重新登录后再试。"))
         else:
-            self.setup_results.put((client, ""))
+            self.setup_results.put((task, client, ""))
+
+    def start_chatgpt_login(self):
+        if self.setup_panel.busy or self.active:
+            return
+        try:
+            open_chrome('https://chatgpt.com/api/auth/session')
+            self.hide()
+        except OSError:
+            self.setup_panel.show_error('无法打开 Chrome，请检查浏览器安装。')
+
+    def import_chatgpt_login(self):
+        if self.setup_panel.busy or self.active:
+            return
+        try:
+            account = import_session(self.root.clipboard_get())
+        except (ValueError, tk.TclError) as error:
+            self.setup_panel.show_error(str(error) if isinstance(error, ValueError) else '请先在 Chrome 的网页会话页面复制完整 JSON。')
+            return
+        task = self.setup_task = uuid.uuid4().hex
+        self.setup_panel.set_busy(True, '正在验证网页登录并连接 ChatGPT…')
+        threading.Thread(target=self.read_chatgpt_login, args=(task, None, account, None), daemon=True).start()
+
+    def use_chatgpt_account(self):
+        if self.setup_panel.busy or self.active:
+            return
+        account = self.setup_panel.account()
+        if not account:
+            return
+        if self.client and self.provider == 'chatgpt' and self.client.client_id == account['client_id']:
+            try:
+                model = self.setup_panel.model() or self.client.model
+                self.client.set_model(model)
+                update_registration(self.client.client_id, {'model': model})
+            except (OSError, ValueError, ChatGPTError):
+                self.setup_panel.show_error('未能保存模型选择，请稍后重试。')
+                return
+            self.chatgpt_model = model
+            self.update_provider_ui()
+            self.save_settings()
+            self.close_setup()
+            return
+        task = self.setup_task = uuid.uuid4().hex
+        self.setup_panel.set_busy(True, "正在验证 ChatGPT 登录并获取可用模型…")
+        threading.Thread(target=self.read_chatgpt_login,
+                         args=(task, None, account, self.setup_panel.model()), daemon=True).start()
+
+    def read_chatgpt_login(self, task, authorization, account, model):
+        client = None
+        try:
+            client = ChatGPTClient(account=account, model=model)
+            client.connect_account()
+        except (OSError, ValueError, ChatGPTError) as error:
+            if client:
+                client.close()
+            record("chatgpt.connect_failed", error=type(error).__name__)
+            description = str(error) if isinstance(error, ChatGPTError) else "无法读取或保存 ChatGPT 登录数据，请重试。"
+            self.setup_results.put((task, None, description))
+        except Exception as error:
+            if client:
+                client.close()
+            record("chatgpt.connect_failed", error=type(error).__name__)
+            self.setup_results.put((task, None, "ChatGPT 连接失败，请重新登录后再试。"))
+        else:
+            self.setup_results.put((task, client, ""))
 
     def open_page(self, url, profile=None):
         try:
@@ -545,6 +869,17 @@ class Popup:
                 self.set_notice(text)
 
     def open_login(self):
+        provider = self.setup_panel.provider() if self.setup_panel.winfo_manager() else self.provider
+        if provider == "chatgpt":
+            if self.setup_panel.winfo_manager():
+                self.start_chatgpt_login()
+            else:
+                try:
+                    open_chrome(self.client.current_url() if self.client else 'https://chatgpt.com/')
+                    self.hide()
+                except OSError:
+                    self.set_notice("未找到 Google Chrome。")
+            return
         url = "https://chat.deepseek.com/"
         if self.setup_panel.winfo_manager():
             profile = self.setup_panel.profile()
@@ -553,6 +888,21 @@ class Popup:
         if self.client and not self.setup_panel.winfo_manager():
             url += "a/chat/s/" + self.client.account["session_id"]
         self.open_page(url, profile)
+
+    def open_chatgpt_usage(self):
+        try:
+            open_chrome("https://chatgpt.com/settings/usage")
+            self.hide()
+        except OSError:
+            self.set_notice("未找到 Google Chrome。")
+
+    def acknowledge_chatgpt_plan(self):
+        try:
+            update_registration(self.client.client_id, {"plan_notice_seen": True})
+        except (OSError, ValueError, KeyError):
+            self.set_notice("未能保存提示状态，下次连接时会再次提示。")
+        else:
+            self.set_notice()
 
     def read_input(self):
         return self.input.get("1.0", "end-1c")
@@ -632,7 +982,7 @@ class Popup:
         return self.ime.composing
 
     def copy_answer(self):
-        text = self.answer_view.selected_text() or self.answer
+        text = self.answer_view.selected_text() or self.answer_view.copyable_text()
         if text:
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
@@ -691,7 +1041,7 @@ class Popup:
         self.set_draft_image(None)
         self.replace_input("")
         self.status.configure(text="●  已发送" if self.demo else "●  正在连接")
-        self.empty.configure(text="等待 DeepSeek 回复…" if self.demo else "正在连接 DeepSeek…")
+        self.empty.configure(text=f"等待 {self.provider_name} 回复…" if self.demo else f"正在连接 {self.provider_name}…")
         self.send_button.grid_remove()
         self.stop_button.set_enabled(True)
         self.stop_button.grid()
@@ -699,8 +1049,8 @@ class Popup:
         if self.demo:
             self.run_demo(self.active)
         else:
-            search = self.search_on.get() and image is None
-            record("desktop.queued", self.active, search=search, thinking=self.thinking_on.get(), image=image is not None)
+            search = self.search_on.get() and (image is None or self.provider == "chatgpt")
+            record("desktop.queued", self.active, provider=self.provider, search=search, thinking=self.thinking_on.get(), image=image is not None)
             self.client.active_request = self.active
             job = dict(type="ask", id=self.active,
                        prompt=text, search=search, thinking=self.thinking_on.get())
@@ -754,13 +1104,17 @@ class Popup:
     def finish_unconfirmed_stop(self, stage):
         self.record_request(stage)
         self.finish("已停止等待")
-        self.set_notice("已停止等待，服务端停止状态尚未确认。", (("查看当前会话", self.open_login),))
+        if self.provider == "chatgpt":
+            self.set_notice("已停止等待，连接正在关闭；已收到的内容保留。")
+        else:
+            self.set_notice("已停止等待，服务端停止状态尚未确认。", (("查看当前会话", self.open_login),))
 
-    def delta(self, answer, thought, search):
+    def delta(self, answer, thought, search, images=()):
         self.answer, self.thought = answer, thought
         if answer:
             self.answer_view.pack(fill="x", pady=(self.dp(5), 0))
-            self.answer_view.set_source(answer)
+            fetch = self.client.load_reply_image if self.client and self.provider=='chatgpt' else None
+            self.answer_view.set_source(answer,images=images,fetch=fetch,open_page=self.open_login if fetch else None)
             self.copy_button.pack(side="right")
             if not self.stop_requested:
                 self.status.configure(text="●  回答中")
@@ -786,6 +1140,9 @@ class Popup:
         self.stop_button.grid_remove()
         self.send_button.grid()
         self.update_input()
+        if self.setup_panel.winfo_manager() and not self.setup_panel.busy:
+            self.setup_panel.connect.configure(state='normal')
+            self.setup_panel.status.configure(text='')
         focus = self.root.focus_get()
         if self.root.state() != "withdrawn" and not self.settings.winfo_manager() and focus is not self.answer_view:
             self.input.focus_set()
@@ -800,7 +1157,12 @@ class Popup:
             self.replace_input(prompt)
             if image:
                 self.set_draft_image(image, self.question_preview_source)
-        self.set_notice(description, (("去 Edge 登录", self.open_login), ("重新读取登录", self.refresh_login)) if login else ())
+        actions = (("重新连接 ChatGPT", self.refresh_login),) if self.provider == "chatgpt" else (("去 Edge 登录", self.open_login), ("重新读取登录", self.refresh_login))
+        if self.provider == "chatgpt" and any(word in description for word in ("额度", "频率")):
+            actions = (("管理 ChatGPT 用量", self.open_chatgpt_usage),)
+        elif not login:
+            actions = ()
+        self.set_notice(description, actions)
 
     def record_request(self, stage, **fields):
         elapsed_ms = round((time.monotonic() - self.request_started) * 1000)
@@ -818,7 +1180,7 @@ class Popup:
             self.started = True
             if not self.first_delta and not self.stop_requested:
                 self.status.configure(text="●  已发送")
-                self.empty.configure(text="等待 DeepSeek 回复…")
+                self.empty.configure(text=f"等待 {self.provider_name} 回复…")
         elif kind == "delta":
             self.started = True
             answer = str(event.get("answer", ""))
@@ -827,13 +1189,16 @@ class Popup:
                 self.record_request("first_delta", has_answer=bool(answer))
             if answer and not self.answer:
                 self.record_request("first_answer")
-            self.delta(answer, str(event.get("thought", "")), event.get("search", ""))
+            self.delta(answer, str(event.get("thought", "")), event.get("search", ""),event.get('images',[]))
         elif kind == "complete":
             answer = event.get("answer")
             if isinstance(answer, str) and answer:
-                self.delta(answer, str(event.get("thought", "")), event.get("search", ""))
-            self.record_request("complete", has_answer=bool(self.answer))
-            self.finish("●  已完成")
+                self.delta(answer, str(event.get("thought", "")), event.get("search", ""),event.get('images',[]))
+            failed = event.get('failed', False)
+            self.record_request("generation_failed" if failed else "complete", has_answer=bool(self.answer))
+            self.finish("生成失败" if failed else "●  已完成")
+            if failed:
+                self.set_notice(str(event.get('notice') or '生成失败，具体原因见上方回复。'))
         elif kind == "stopped":
             if event.get("confirmed") is False:
                 self.finish_unconfirmed_stop("stop_unconfirmed")
@@ -842,26 +1207,50 @@ class Popup:
                 self.finish("已停止")
         elif kind in ("login", "error"):
             self.record_request(kind, started=self.started)
-            self.fail(str(event.get("text") or "网页请求失败，请在 Edge 查看。"), login=kind == "login")
+            self.fail(str(event.get("text") or f"{self.provider_name} 请求失败，请稍后重试。"), login=kind == "login")
 
     def tick(self):
         while True:
             try:
-                client, error = self.setup_results.get_nowait()
+                task, client, error = self.setup_results.get_nowait()
             except Empty:
                 break
+            if task != self.setup_task:
+                if client:
+                    client.close()
+                continue
+            self.setup_task = self.authorization = None
             self.setup_panel.set_busy(False)
             if error:
+                self.setup_panel.source_changed()
                 self.setup_panel.show_error(error)
+                if self.root.state() == "withdrawn":
+                    self.show()
             else:
+                if client.provider == "chatgpt":
+                    try:
+                        update_registration(client.client_id, activate=True)
+                    except (OSError, ValueError, KeyError):
+                        client.close()
+                        self.setup_panel.show_error("未能保存 ChatGPT 账号选择，原有连接已保留。")
+                        continue
+                if self.client:
+                    self.client.close()
                 self.client = client
+                self.provider = client.provider
+                if self.provider == "chatgpt":
+                    self.chatgpt_model = client.model
+                self.update_provider_ui()
+                self.save_settings()
                 self.ready = True
                 self.needs_login = False
+                self.reset()
                 self.set_notice()
                 self.close_setup()
+                self.show()
         if self.windows:
             self.windows.poll()
-            if (self.root.state() != "withdrawn" and time.monotonic() >= self.focus_grace
+            if (not self.pinned_device and self.root.state() != "withdrawn" and time.monotonic() >= self.focus_grace
                     and not self.windows.foreground()):
                 self.hide()
         self.input_composing()
@@ -883,12 +1272,12 @@ class Popup:
             if self.active and not self.stop_requested and now >= self.deadline:
                 self.record_request("reply_timeout", started=self.started, received_delta=self.first_delta)
                 self.cancel_request()
-                self.fail("等待 DeepSeek 回复超时，已保留收到的内容。")
+                self.fail(f"等待 {self.provider_name} 回复超时，已保留收到的内容。")
             elif (self.active and not self.stop_requested and not (self.started or self.first_delta)
                   and now - self.request_started >= (IMAGE_START_TIMEOUT if self.pending_image else REQUEST_START_TIMEOUT)):
                 self.record_request("start_timeout")
                 self.cancel_request()
-                self.fail("图片上传或发送超时，请稍后重试。" if self.pending_image else "连接 DeepSeek 超时，请稍后重试。")
+                self.fail("图片上传或发送超时，请稍后重试。" if self.pending_image else f"连接 {self.provider_name} 超时，请稍后重试。")
         self.root.after(75, self.tick)
 
 

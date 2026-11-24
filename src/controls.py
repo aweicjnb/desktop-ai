@@ -28,6 +28,8 @@ class WindowResize:
 
     def __init__(self, root, scale):
         self.root = root
+        self.enabled = True
+        self.constrain = None
         self.set_scale(scale)
         self.drag = None
         self.cursor = None
@@ -54,6 +56,8 @@ class WindowResize:
             self.attach(child)
 
     def direction(self, x, y):
+        if not self.enabled:
+            return ''
         x -= self.root.winfo_rootx()
         y -= self.root.winfo_rooty()
         width, height = self.root.winfo_width(), self.root.winfo_height()
@@ -109,7 +113,11 @@ class WindowResize:
                 top = min(top + dy, bottom - self.min_height)
             if "s" in direction:
                 bottom = max(bottom + dy, top + self.min_height)
-            self.root.geometry(f"{right - left}x{bottom - top}+{left}+{top}")
+            rect = (left, top, right-left, bottom-top)
+            if self.constrain:
+                rect = self.constrain(rect)
+            left, top, width, height = rect
+            self.root.geometry(f"{width}x{height}+{left}+{top}")
             return "break"
 
     def end(self, event):
@@ -124,22 +132,63 @@ class WindowResize:
 
 
 class IconButton(tk.Canvas):
-    def __init__(self, parent, icon, command, colors, scale, background):
+    def __init__(self, parent, icon, command, colors, scale, background, tooltip=''):
         self.icon, self.command, self.colors = icon, command, colors
         self.scale, self.background = scale, background
         self.enabled, self.hover, self.focused, self.selected = True, False, False, False
+        self.tooltip, self.tip_timer, self.tip_window = tooltip, None, None
         super().__init__(parent, bg=colors[background], borderwidth=0,
                          highlightthickness=0, cursor="hand2", takefocus=True)
         self.set_scale(scale)
         self.bind("<Configure>", self.paint)
         self.bind("<Map>", self.paint)
-        self.bind("<Enter>", lambda event: self.set_flag("hover", True))
-        self.bind("<Leave>", lambda event: self.set_flag("hover", False))
+        self.bind("<Enter>", self.enter)
+        self.bind("<Leave>", self.leave)
         self.bind("<FocusIn>", lambda event: self.set_flag("focused", True))
         self.bind("<FocusOut>", lambda event: self.set_flag("focused", False))
         self.bind("<ButtonRelease-1>", self.invoke)
         self.bind("<Return>", self.invoke)
         self.bind("<space>", self.invoke)
+        self.bind('<Unmap>', lambda event: self.hide_tip())
+
+    def enter(self, event):
+        self.set_flag('hover', True)
+        if self.tooltip:
+            self.tip_timer = self.after(550, self.show_tip)
+
+    def leave(self, event):
+        self.set_flag('hover', False)
+        self.hide_tip()
+
+    def show_tip(self):
+        self.tip_timer = None
+        if not self.hover or not self.tooltip or not self.winfo_ismapped():
+            return
+        self.tip_window = tk.Toplevel(self)
+        self.tip_window.overrideredirect(True)
+        self.tip_window.attributes('-topmost', True)
+        c, s = self.colors, self.scale
+        self.tip_window.configure(bg=c['line'])
+        tk.Label(self.tip_window, text=self.tooltip, bg=c['soft'], fg=c['ink'],
+                 font=(FONT_FAMILY, font_pixels(8, s)), padx=round(8*s), pady=round(5*s)).pack(padx=1, pady=1)
+        self.tip_window.update_idletasks()
+        x = self.winfo_rootx()+self.winfo_width()-self.tip_window.winfo_reqwidth()
+        self.tip_window.geometry(f'+{x}+{self.winfo_rooty()+self.winfo_height()+round(5*s)}')
+
+    def hide_tip(self):
+        if self.tip_timer:
+            self.after_cancel(self.tip_timer)
+            self.tip_timer = None
+        if self.tip_window:
+            self.tip_window.destroy()
+            self.tip_window = None
+
+    def set_icon(self, icon, tooltip=None):
+        self.icon = icon
+        if tooltip is not None:
+            self.tooltip = tooltip
+        self.hide_tip()
+        self.paint()
 
     def set_scale(self, scale):
         self.scale = scale
@@ -158,6 +207,7 @@ class IconButton(tk.Canvas):
             self.paint()
 
     def invoke(self, event=None):
+        self.hide_tip()
         if self.enabled:
             self.command()
         return "break"
@@ -186,6 +236,21 @@ class IconButton(tk.Canvas):
                              fill=c[ink], width=stroke, joinstyle="round", capstyle="round")
         elif self.icon == "stop":
             rounded(self, x - 4*s, y - 4*s, x + 4*s, y + 4*s, 2*s, fill=c[ink])
+        elif self.icon in ('fullscreen', 'restore'):
+            if self.icon == 'fullscreen':
+                for dx, dy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+                    self.create_line(x+dx*6*s, y+dy*2*s, x+dx*6*s, y+dy*6*s, x+dx*2*s, y+dy*6*s,
+                                     fill=c[ink], width=stroke, capstyle='round', joinstyle='round')
+            else:
+                self.create_rectangle(x-3*s, y-6*s, x+6*s, y+3*s, outline=c[ink], width=stroke)
+                self.create_rectangle(x-6*s, y-3*s, x+3*s, y+6*s, fill=c[fill], outline=c[ink], width=stroke)
+        elif self.icon == 'pin':
+            self.create_line(x-4*s, y-6*s, x+4*s, y-6*s, fill=c[ink], width=stroke, capstyle='round')
+            self.create_line(x-3*s, y-6*s, x-3*s, y-1*s, x-5*s, y+2*s, x+5*s, y+2*s,
+                             x+3*s, y-1*s, x+3*s, y-6*s, fill=c[ink], width=stroke, joinstyle='round')
+            self.create_line(x, y+2*s, x, y+7*s, fill=c[ink], width=stroke, capstyle='round')
+        elif self.icon == 'back':
+            self.create_line(x+3*s, y-5*s, x-3*s, y, x+3*s, y+5*s, fill=c[ink], width=stroke, capstyle='round', joinstyle='round')
         else:
             for offset, knob in ((-3, -2), (3, 2)):
                 line_y = y + offset*s
@@ -195,10 +260,15 @@ class IconButton(tk.Canvas):
                 self.create_oval(knob_x - 1.7*s, line_y - 1.7*s, knob_x + 1.7*s, line_y + 1.7*s,
                                  fill=c[fill], outline=c[ink], width=stroke)
 
+    def destroy(self):
+        self.hide_tip()
+        super().destroy()
+
 
 class SettingsPanel(tk.Canvas):
-    def __init__(self, parent, colors, scale, options, save):
+    def __init__(self, parent, colors, scale, options, save, actions=()):
         self.colors, self.scale, self.options, self.save = colors, scale, options, save
+        self.actions = actions
         self.hover = None
         self.selected = 0
         self.focused = False
@@ -217,11 +287,11 @@ class SettingsPanel(tk.Canvas):
 
     def set_scale(self, scale):
         self.scale = scale
-        self.configure(width=round(202 * scale), height=round(108 * scale))
+        self.configure(width=round(202 * scale), height=round((36 + 36 * (len(self.options) + len(self.actions))) * scale))
 
     def row_at(self, y):
         local = y / self.scale
-        return int((local - 28) // 36) if 28 <= local < 100 else None
+        return int((local - 28) // 36) if 28 <= local < 28 + 36 * (len(self.options) + len(self.actions)) else None
 
     def highlight(self, row):
         if self.hover != row:
@@ -243,11 +313,14 @@ class SettingsPanel(tk.Canvas):
         self.paint()
 
     def move(self, offset):
-        self.selected = (self.selected + offset) % len(self.options)
+        self.selected = (self.selected + offset) % (len(self.options) + len(self.actions))
         self.paint()
         return "break"
 
     def toggle(self, row):
+        if row >= len(self.options):
+            self.actions[row - len(self.options)][1]()
+            return "break"
         variable = self.options[row][1]
         variable.set(not variable.get())
         self.save()
@@ -275,3 +348,11 @@ class SettingsPanel(tk.Canvas):
             k = x + (7 if value.get() else -7)*s
             self.create_oval(k - 5.5*s, y - 5.5*s, k + 5.5*s, y + 5.5*s,
                              fill=c["action_ink"] if value.get() else c["muted"], outline="")
+        for index, (label, _action) in enumerate(self.actions, len(self.options)):
+            y = (46 + index * 36) * s
+            if self.hover == index or (self.focused and self.selected == index):
+                rounded(self, 6*s, y - 15*s, w - 6*s, y + 15*s, 7*s, fill=c["soft"])
+            self.create_text(13*s, y, text=label, anchor="w", fill=c["ink"],
+                             font=(FONT_FAMILY, font_pixels(10, s)))
+            self.create_text(w - 22*s, y, text="›", fill=c["muted"],
+                             font=(FONT_FAMILY, font_pixels(13, s)))

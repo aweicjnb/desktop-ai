@@ -1,0 +1,17 @@
+{
+  "verified_at": "2026-11-24T21:37:15.464755+08:00",
+  "elapsed_s": 23.34,
+  "terminal": "complete",
+  "service_failure": false,
+  "returned_image_count": 1,
+  "image": {
+    "kind": "generated",
+    "format": ".png",
+    "width": 1448,
+    "height": 1086,
+    "bytes": 1670920
+  },
+  "original_conversation_unchanged": true,
+  "actual_previous_refusals_recognized": 2,
+  "same_conversation_followup_completed": true
+}

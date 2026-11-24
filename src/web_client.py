@@ -97,6 +97,8 @@ class Stream:
 
 
 class WebClient:
+    provider = "deepseek"
+
     def __init__(self, account=None):
         self.account = dict(account) if account is not None else load_account()
         if account is None and not self.account.get("session_id"):

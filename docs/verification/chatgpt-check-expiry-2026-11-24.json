@@ -1,0 +1,158 @@
+{
+  "started_at": "2026-11-24T20:04:34.814466+08:00",
+  "scope": "same account/device; two independent unused checks minted before the waiting period; each check submitted only once",
+  "production_changed": false,
+  "samples": [
+    {
+      "label": "before_expiry",
+      "target_age_s": 510,
+      "actual_unused_age_s": 510.001,
+      "intervening_production_checks": 0,
+      "identical_check_headers": true,
+      "completion_http_status": 200,
+      "complete": true,
+      "expected_reply": true,
+      "first_answer_ms": 5601,
+      "total_ms": 6327,
+      "http_errors": [],
+      "server_expire_after_s": 540,
+      "server_expire_at": 1795522418
+    },
+    {
+      "label": "after_expiry",
+      "target_age_s": 555,
+      "actual_unused_age_s": 555.001,
+      "intervening_production_checks": 0,
+      "identical_check_headers": true,
+      "completion_http_status": 200,
+      "complete": true,
+      "expected_reply": true,
+      "first_answer_ms": 4660,
+      "total_ms": 5837,
+      "http_errors": [],
+      "server_expire_after_s": 540,
+      "server_expire_at": 1795522421
+    },
+    {
+      "label": "fresh_control_after_boundary_test",
+      "target_age_s": 0,
+      "actual_unused_age_s": 0.004,
+      "intervening_production_checks": 0,
+      "identical_check_headers": true,
+      "completion_http_status": 200,
+      "complete": true,
+      "expected_reply": true,
+      "first_answer_ms": 3276,
+      "total_ms": 4647,
+      "http_errors": []
+    }
+  ],
+  "metadata": [
+    {
+      "responses": [
+        {
+          "stage": "check_prepare",
+          "root_field_names": [
+            "persona",
+            "prepare_token",
+            "proofofwork",
+            "so",
+            "turnstile"
+          ],
+          "explicit_expiry_fields": {}
+        },
+        {
+          "stage": "check_finalize",
+          "root_field_names": [
+            "expire_after",
+            "expire_at",
+            "persona",
+            "token"
+          ],
+          "explicit_expiry_fields": {
+            "expire_after": 540,
+            "expire_at": 1795522418
+          }
+        }
+      ],
+      "jwt_time_claims": []
+    },
+    {
+      "responses": [
+        {
+          "stage": "check_prepare",
+          "root_field_names": [
+            "persona",
+            "prepare_token",
+            "proofofwork",
+            "so",
+            "turnstile"
+          ],
+          "explicit_expiry_fields": {}
+        },
+        {
+          "stage": "check_finalize",
+          "root_field_names": [
+            "expire_after",
+            "expire_at",
+            "persona",
+            "token"
+          ],
+          "explicit_expiry_fields": {
+            "expire_after": 540,
+            "expire_at": 1795522421
+          }
+        }
+      ],
+      "jwt_time_claims": []
+    },
+    {
+      "responses": [
+        {
+          "stage": "check_prepare",
+          "root_field_names": [
+            "persona",
+            "prepare_token",
+            "proofofwork",
+            "so",
+            "turnstile"
+          ],
+          "explicit_expiry_fields": {}
+        },
+        {
+          "stage": "check_finalize",
+          "root_field_names": [
+            "expire_after",
+            "expire_at",
+            "persona",
+            "token"
+          ],
+          "explicit_expiry_fields": {
+            "expire_after": 540,
+            "expire_at": 1795522986
+          }
+        }
+      ],
+      "jwt_time_claims": []
+    }
+  ],
+  "schedule": [
+    {
+      "label": "before_expiry",
+      "expire_after_s": 540,
+      "expire_at": 1795522418,
+      "target_age_s": 510
+    },
+    {
+      "label": "after_expiry",
+      "expire_after_s": 540,
+      "expire_at": 1795522421,
+      "target_age_s": 555
+    }
+  ],
+  "conclusion": "server reported a 540-second expiry; unused checks succeeded at 510 and 555 seconds; a hard rejection boundary was not established by these samples",
+  "finished_at": "2026-11-24T20:14:11.574187+08:00",
+  "declared_lifetime_seconds": 540,
+  "minimum_observed_unused_acceptance_seconds": 555.001,
+  "hard_rejection_boundary_verified": false
+}

@@ -1,0 +1,55 @@
+{
+  "verified_at": "2026-11-24T19:55:15.474850+08:00",
+  "scope": "same account, same device, same process and test conversation; identical finalized check headers",
+  "search": false,
+  "thinking": false,
+  "attempts": [
+    {
+      "attempt": "fresh_unused_after_30_seconds",
+      "check_age_before_send_s": 30.001,
+      "generated_new_check": false,
+      "identical_check_headers": true,
+      "completion_http_status": 200,
+      "completed": true,
+      "expected_reply": true,
+      "first_answer_ms": 4303,
+      "total_ms": 5072,
+      "http_errors": []
+    },
+    {
+      "attempt": "reuse_used_warmed_check",
+      "check_age_before_send_s": 35.076,
+      "generated_new_check": false,
+      "identical_check_headers": true,
+      "completion_http_status": null,
+      "completed": false,
+      "expected_reply": false,
+      "first_answer_ms": null,
+      "total_ms": 2025,
+      "http_errors": [
+        {
+          "http_status": "403",
+          "phase": "completion",
+          "code": "unknown"
+        }
+      ],
+      "failure_type": "error"
+    },
+    {
+      "attempt": "fresh_control_after_rejection",
+      "check_age_before_send_s": 37.104,
+      "generated_new_check": true,
+      "identical_check_headers": true,
+      "completion_http_status": 200,
+      "completed": true,
+      "expected_reply": true,
+      "first_answer_ms": 5520,
+      "total_ms": 6491,
+      "http_errors": []
+    }
+  ],
+  "production_changed": false,
+  "warm_check_generated_before_first_send": true,
+  "conclusion": "cached check rejected; new check accepted",
+  "new_check_count": 2
+}

@@ -1,0 +1,21 @@
+{
+  "verified_at": "2026-11-24T21:16:00.014355+08:00",
+  "original_conversation_unchanged": true,
+  "live_reply_completed": true,
+  "raw_component_tags_visible": false,
+  "returned_image_count": 1,
+  "live_search_image": {
+    "loaded": true,
+    "format": ".jpg",
+    "width": 800,
+    "height": 450,
+    "bytes": 60630
+  },
+  "existing_generated_image": {
+    "loaded": true,
+    "format": ".png",
+    "width": 1312,
+    "height": 1199,
+    "bytes": 2329939
+  }
+}

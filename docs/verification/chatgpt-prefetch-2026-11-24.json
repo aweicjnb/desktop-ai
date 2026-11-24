@@ -1,0 +1,27 @@
+{
+  "verified_at": "2026-11-24T20:42:21.682091+08:00",
+  "refresh_seconds": 480,
+  "turns": [
+    {
+      "turn": 1,
+      "search": true,
+      "completed": true,
+      "fresh_unused_check": true,
+      "cache_waited_ms": 0,
+      "first_answer_ms": 4467,
+      "total_ms": 6378
+    },
+    {
+      "turn": 2,
+      "search": true,
+      "completed": true,
+      "fresh_unused_check": true,
+      "cache_waited_ms": 0,
+      "first_answer_ms": 4886,
+      "total_ms": 5811
+    }
+  ],
+  "initial_prefetch_ms": 3911,
+  "next_unused_check_ready": true,
+  "worker_stopped_on_close": true
+}

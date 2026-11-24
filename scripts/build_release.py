@@ -10,7 +10,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 PROJECT = Path(__file__).resolve().parents[1]
 PYTHON_VERSION = (3, 13, 15)
 PYTHON_SHA256 = "d1f04d990aee1253d8569e8e5104e30fa9f5fa830899f14843448872d936a2cf"
-RELEASE_NAME = "desktop-ai-v0.2.0-windows-x64.zip"
+RELEASE_NAME = "desktop-ai-v0.3.5-windows-x64.zip"
 
 LAUNCHER = r"""@echo off
 setlocal
@@ -45,8 +45,20 @@ def build(runtime_zip, output):
         app.mkdir()
         for name in ("DesktopAI.pyw", "README.md"):
             shutil.copy2(PROJECT / name, app / name)
-        for name in ("src", "assets", "docs/screenshots"):
+        for name in ("src", "assets", "docs"):
             shutil.copytree(PROJECT / name, app / name, ignore=ignore)
+        chatgpt = PROJECT / '.runtime/chatgpt'
+        required = ('node.exe', 'client-module.js', 'node_modules/jsdom/lib/api.js')
+        if not all((chatgpt / name).is_file() for name in required):
+            raise RuntimeError('Run scripts/setup_chatgpt_runtime.py before building the ChatGPT portable package.')
+        shutil.copytree(chatgpt, app / '.runtime/chatgpt', ignore=ignore)
+        images = PROJECT / '.runtime/images'
+        if not (images / 'version.txt').is_file() or not (images / 'PIL/Image.py').is_file():
+            raise RuntimeError('Run scripts/setup_image_runtime.py before building the image-capable portable package.')
+        shutil.copytree(images, app / '.runtime/images', ignore=ignore)
+        (app / 'scripts').mkdir()
+        shutil.copy2(PROJECT / 'scripts/setup_chatgpt_runtime.py', app / 'scripts/setup_chatgpt_runtime.py')
+        shutil.copy2(PROJECT / 'scripts/setup_image_runtime.py', app / 'scripts/setup_image_runtime.py')
         runtime = app / "runtime"
         with ZipFile(runtime_zip) as archive:
             archive.extractall(runtime)

@@ -4,9 +4,15 @@ from pathlib import Path
 import re
 import sys
 import tkinter as tk
-from tkinter import font
+from tkinter import font, filedialog, messagebox
+from queue import Empty
+import webbrowser
 
 from controls import FONT_FAMILY, font_pixels
+from image_codec import photo_image
+from reply_images import ReplyImages
+from rich_content import IMAGE_SCHEME, MAX_REPLY_IMAGES, https_url, image_key, copyable_text
+from windows import monitor_at
 
 sys.path.insert(0, str(Path(__file__).with_name("_vendor")))
 from mistune import create_markdown
@@ -50,6 +56,15 @@ class AnswerView(tk.Text):
                          padx=0, pady=0, exportselection=False, takefocus=True, cursor="xterm",
                          selectbackground=colors["accent"], selectforeground=colors["action_ink"])
         self.source = self.rendered = ""
+        self.colors = colors
+        self.media = {}
+        self.photos = {}
+        self.image_widgets = []
+        self.image_loader = ReplyImages()
+        self.image_fetch = self.open_page = None
+        self.image_poll_job = None
+        self.preview = None
+        self.press_point = None
         self.rendered_width = 0
         self.render_job = None
         self.dragging = False
@@ -107,6 +122,7 @@ class AnswerView(tk.Text):
     def begin_selection(self, event):
         self.focus_set()
         self.dragging = True
+        self.press_point = (event.x,event.y)
 
     def end_selection(self, event):
         self.dragging = False
@@ -129,12 +145,21 @@ class AnswerView(tk.Text):
         self.tag_add("sel", "1.0", "end-1c")
         return "break"
 
-    def set_source(self, source):
+    def set_source(self, source, images=(), fetch=None, open_page=None):
         self.source = source
+        self.image_fetch, self.open_page = fetch, open_page
+        images=images if isinstance(images,(list,tuple)) else ()
+        for descriptor in images[:MAX_REPLY_IMAGES]:
+            self.register_image(descriptor)
         self.schedule()
 
     def clear(self):
         self.source = ""
+        self.image_fetch = self.open_page = None
+        self.image_loader.clear()
+        self.media.clear()
+        self.photos.clear()
+        self.close_preview()
         self.dragging = False
         self.tag_remove("sel", "1.0", "end")
         self.paint()
@@ -156,6 +181,9 @@ class AnswerView(tk.Text):
             self.configure(state="normal")
             try:
                 self.delete("1.0", "end")
+                for widget in self.image_widgets:
+                    widget.destroy()
+                self.image_widgets.clear()
                 self.table_number = 0
                 self.measure_cache.clear()
                 for token in _parse(self.source):
@@ -181,8 +209,7 @@ class AnswerView(tk.Text):
         if kind == "heading":
             tags += (f"heading{min(3, token['attrs']['level'])}",)
         if kind in ("paragraph", "block_text", "heading"):
-            for text, inline_tags in spans(children, tags):
-                self.put(text, inline_tags)
+            self.inline(children, tags)
             self.put("\n", tags)
         elif kind == "blank_line":
             self.put("\n", ("space",))
@@ -204,6 +231,191 @@ class AnswerView(tk.Text):
                 self.block(child, tags + (("quote",) if kind == "block_quote" else ()))
         elif token.get("raw"):
             self.put(token["raw"], tags)
+
+    def inline(self, tokens, tags=()):
+        emphasis = {'strong':'strong','emphasis':'emphasis','strikethrough':'strike'}
+        for text_group, group in groupby(tokens,key=lambda item:item['type']=='text'):
+            items=list(group)
+            if text_group:
+                for text, inline_tags in spans(items,tags):
+                    self.put(text,inline_tags)
+                continue
+            for item in items:
+                kind=item['type']
+                if kind=='image':
+                    self.draw_image(item.get('attrs',{}).get('url',''), ''.join(text for text,_ in spans(item.get('children',[]))))
+                elif kind in emphasis:
+                    self.inline(item.get('children',[]),tags+(emphasis[kind],))
+                elif kind=='link':
+                    url=item.get('attrs',{}).get('url','')
+                    name='url_'+image_key(url)
+                    self.tag_configure(name,foreground=self.colors['accent'],underline=True)
+                    self.tag_bind(name,'<ButtonRelease-1>',lambda event,target=url:self.click_link(event,target))
+                    self.inline(item.get('children',[]),tags+(name,))
+                else:
+                    for text, inline_tags in spans([item],tags):
+                        self.put(text,inline_tags)
+
+    def click_link(self, event, url):
+        if self.tag_ranges('sel') or self.press_point and abs(event.x-self.press_point[0])+abs(event.y-self.press_point[1])>5:
+            return
+        if https_url(url):
+            webbrowser.open(url)
+
+    def register_image(self, descriptor):
+        key=descriptor.get('key')
+        if not isinstance(key,str) or len(self.media)>=MAX_REPLY_IMAGES and key not in self.media:
+            return None
+        state=self.media.get(key)
+        if state is None:
+            state=self.media[key]={'descriptor':descriptor,'revision':0,'loaded':None,'error':None,'submitted':False}
+        elif state['descriptor']!=descriptor:
+            state.update(descriptor=descriptor,revision=state['revision']+1,loaded=None,error=None,submitted=False)
+            self.photos.pop(key,None)
+        if self.image_fetch and not state['submitted'] and not (descriptor.get('kind')=='pending' and descriptor.get('asset_pointer')):
+            state['submitted']=True
+            self.image_loader.submit(key,state['revision'],descriptor,self.image_fetch)
+            if self.image_poll_job is None:
+                self.image_poll_job=self.after(70,self.poll_images)
+        return state
+
+    def poll_images(self):
+        self.image_poll_job=None
+        changed=False
+        while True:
+            try:
+                generation,key,revision,loaded,error=self.image_loader.results.get_nowait()
+            except Empty:
+                break
+            state=self.media.get(key)
+            if generation==self.image_loader.generation and state and state['revision']==revision:
+                state.update(loaded=loaded,error=error)
+                self.photos.pop(key,None)
+                changed=True
+        if changed:
+            self.rendered_width=0
+            self.schedule()
+        if self.image_loader.pending():
+            self.image_poll_job=self.after(70,self.poll_images)
+
+    def draw_image(self, url, alt):
+        key=url[len(IMAGE_SCHEME):] if url.startswith(IMAGE_SCHEME) else image_key(url)
+        state=self.media.get(key)
+        if state is None and https_url(url):
+            if not self.image_fetch:
+                self.put(alt or '[图片]')
+                return
+            state=self.register_image({'key':key,'kind':'remote','url':url,'title':alt or '图片'})
+        if state is None:
+            self.put(alt or '[图片]')
+            return
+        c=self.colors
+        width=max(self.dp(80),self.winfo_width()-self.dp(4))
+        loaded=state['loaded']
+        photo=None
+        if loaded:
+            cached=self.photos.get(key)
+            size=(width,self.dp(360))
+            if not cached or cached[0]!=size:
+                cached=self.photos[key]=(size,photo_image(loaded,*size,master=self))
+            photo=cached[1]
+        height=photo.height() if photo else self.dp(70)
+        frame=tk.Frame(self,bg=c['window'],width=width,height=height+self.dp(29))
+        frame.pack_propagate(False)
+        canvas=tk.Canvas(frame,width=width,height=height,bg=c['soft'],bd=0,highlightthickness=0)
+        canvas.pack(fill='x')
+        if photo:
+            canvas.create_image(width/2,0,image=photo,anchor='n')
+            canvas.configure(cursor='hand2')
+            canvas.bind('<Button-1>',lambda event,item=loaded:self.show_preview(item))
+        else:
+            text=state['error'] or ('图片生成中…' if state['descriptor'].get('asset_pointer') else '图片加载中…')
+            canvas.create_text(width/2,height/2,text=text,fill=c['muted'],font=self.regular,width=width-self.dp(20))
+        footer=tk.Frame(frame,bg=c['window'])
+        footer.pack(fill='x',pady=(self.dp(3),0))
+        def action(text,command,side='right'):
+            label=tk.Label(footer,text=text,font=self.regular,bg=c['window'],fg=c['accent'],cursor='hand2')
+            label.pack(side=side,padx=(self.dp(8),0))
+            label.bind('<Button-1>',lambda event:command())
+        if loaded:
+            source_url=state['descriptor'].get('source_url')
+            if https_url(source_url):
+                action('图片来源',lambda:webbrowser.open(source_url),side='left')
+            action('保存图片',lambda:self.save_image(loaded))
+            action('查看大图',lambda:self.show_preview(loaded))
+        elif state['error']:
+            action('重试',lambda:self.retry_image(key))
+            if self.open_page:
+                action('查看网页',self.open_page)
+        self.image_widgets.append(frame)
+        self.window_create('end',window=frame,align='top')
+
+    def retry_image(self,key):
+        state=self.media.get(key)
+        if state:
+            state.update(submitted=False,error=None)
+            self.register_image(state['descriptor'])
+            self.rendered_width=0
+            self.schedule()
+
+    def save_image(self,loaded):
+        filename=filedialog.asksaveasfilename(parent=self.winfo_toplevel(),title='保存图片',
+            initialfile='ChatGPT 图片'+loaded.extension,defaultextension=loaded.extension,
+            filetypes=[('图片','*'+loaded.extension),('所有文件','*.*')])
+        if filename:
+            try:
+                Path(filename).write_bytes(loaded.raw)
+            except OSError:
+                messagebox.showerror('保存图片','图片未能保存，请选择其他位置。',parent=self.winfo_toplevel())
+
+    def close_preview(self):
+        if self.preview is not None:
+            self.preview.destroy()
+            self.preview=None
+
+    def show_preview(self,loaded):
+        self.close_preview()
+        c=self.colors
+        view=self.preview=tk.Toplevel(self)
+        view.title('查看图片')
+        view.configure(bg=c['window'])
+        view.attributes('-topmost',True)
+        view.transient(self.winfo_toplevel())
+        screen=monitor_at(self.winfo_rootx(),self.winfo_rooty())
+        left,top,right,bottom=screen['work'] if screen else (0,0,self.winfo_screenwidth(),self.winfo_screenheight())
+        width=min(round((right-left)*.8),max(self.dp(360),loaded.image.width))
+        height=min(round((bottom-top)*.8),max(self.dp(260),loaded.image.height+self.dp(45)))
+        view.geometry(f'{width}x{height}+{left+(right-left-width)//2}+{top+(bottom-top-height)//2}')
+        action=tk.Button(view,text='保存图片',command=lambda:self.save_image(loaded),relief='flat',bd=0,
+                         font=self.regular,bg=c['soft'],fg=c['ink'],cursor='hand2')
+        action.pack(side='bottom',pady=self.dp(6))
+        canvas=tk.Canvas(view,bg=c['window'],bd=0,highlightthickness=0)
+        canvas.pack(fill='both',expand=True)
+        def draw(event=None):
+            size=canvas.winfo_width(),canvas.winfo_height()
+            if getattr(view,'photo_size',None)==size:
+                return
+            view.photo_size=size
+            view.photo=photo_image(loaded,*size,master=view)
+            canvas.delete('all');canvas.create_image(size[0]/2,size[1]/2,image=view.photo)
+        canvas.bind('<Configure>',draw)
+        def destroy(event):
+            if event.widget is view and self.preview is view:
+                self.preview=None
+        view.bind('<Destroy>',destroy)
+        view.bind('<Escape>',lambda event:(view.destroy(),'break')[1])
+
+    def copyable_text(self):
+        return copyable_text(self.source)
+
+    def destroy(self):
+        self.image_loader.close()
+        self.close_preview()
+        for timer in (self.render_job,self.image_poll_job):
+            if timer is not None:
+                self.after_cancel(timer)
+        self.photos.clear()
+        super().destroy()
 
     def measure(self, text, tags):
         style = "code" if "code" in tags else "strong" if "strong" in tags else ""

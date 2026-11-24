@@ -1,0 +1,213 @@
+{
+  "started_at": "2026-11-24T20:16:01.544096+08:00",
+  "scope": "same account/device; independent unused checks minted before the waiting period; each check submitted only once",
+  "production_changed": false,
+  "samples": [
+    {
+      "label": "unused_after_reported_expiry_plus_30",
+      "target_age_s": 570,
+      "actual_unused_age_s": 570.001,
+      "intervening_production_checks": 0,
+      "identical_check_headers": true,
+      "completion_http_status": 200,
+      "complete": true,
+      "expected_reply": true,
+      "first_answer_ms": 4600,
+      "total_ms": 6360,
+      "http_errors": [],
+      "server_expire_after_s": 540,
+      "server_expire_at": 1795523105
+    },
+    {
+      "label": "unused_after_reported_expiry_plus_60",
+      "target_age_s": 600,
+      "actual_unused_age_s": 600.001,
+      "intervening_production_checks": 0,
+      "identical_check_headers": true,
+      "completion_http_status": 200,
+      "complete": true,
+      "expected_reply": true,
+      "first_answer_ms": 4542,
+      "total_ms": 5394,
+      "http_errors": [],
+      "server_expire_after_s": 540,
+      "server_expire_at": 1795523108
+    },
+    {
+      "label": "unused_after_reported_expiry_plus_75",
+      "target_age_s": 615,
+      "actual_unused_age_s": 615.001,
+      "intervening_production_checks": 0,
+      "identical_check_headers": true,
+      "completion_http_status": 200,
+      "complete": true,
+      "expected_reply": true,
+      "first_answer_ms": 3691,
+      "total_ms": 4617,
+      "http_errors": [],
+      "server_expire_after_s": 540,
+      "server_expire_at": 1795523111
+    },
+    {
+      "label": "unused_after_reported_expiry_plus_360",
+      "target_age_s": 900,
+      "actual_unused_age_s": 900.001,
+      "intervening_production_checks": 0,
+      "identical_check_headers": true,
+      "completion_http_status": 200,
+      "complete": true,
+      "expected_reply": true,
+      "first_answer_ms": 3970,
+      "total_ms": 7352,
+      "http_errors": [],
+      "server_expire_after_s": 540,
+      "server_expire_at": 1795523113
+    }
+  ],
+  "metadata": [
+    {
+      "responses": [
+        {
+          "stage": "check_prepare",
+          "root_field_names": [
+            "persona",
+            "prepare_token",
+            "proofofwork",
+            "so",
+            "turnstile"
+          ],
+          "explicit_expiry_fields": {}
+        },
+        {
+          "stage": "check_finalize",
+          "root_field_names": [
+            "expire_after",
+            "expire_at",
+            "persona",
+            "token"
+          ],
+          "explicit_expiry_fields": {
+            "expire_after": 540,
+            "expire_at": 1795523105
+          }
+        }
+      ],
+      "jwt_time_claims": []
+    },
+    {
+      "responses": [
+        {
+          "stage": "check_prepare",
+          "root_field_names": [
+            "persona",
+            "prepare_token",
+            "proofofwork",
+            "so",
+            "turnstile"
+          ],
+          "explicit_expiry_fields": {}
+        },
+        {
+          "stage": "check_finalize",
+          "root_field_names": [
+            "expire_after",
+            "expire_at",
+            "persona",
+            "token"
+          ],
+          "explicit_expiry_fields": {
+            "expire_after": 540,
+            "expire_at": 1795523108
+          }
+        }
+      ],
+      "jwt_time_claims": []
+    },
+    {
+      "responses": [
+        {
+          "stage": "check_prepare",
+          "root_field_names": [
+            "persona",
+            "prepare_token",
+            "proofofwork",
+            "so",
+            "turnstile"
+          ],
+          "explicit_expiry_fields": {}
+        },
+        {
+          "stage": "check_finalize",
+          "root_field_names": [
+            "expire_after",
+            "expire_at",
+            "persona",
+            "token"
+          ],
+          "explicit_expiry_fields": {
+            "expire_after": 540,
+            "expire_at": 1795523111
+          }
+        }
+      ],
+      "jwt_time_claims": []
+    },
+    {
+      "responses": [
+        {
+          "stage": "check_prepare",
+          "root_field_names": [
+            "persona",
+            "prepare_token",
+            "proofofwork",
+            "so",
+            "turnstile"
+          ],
+          "explicit_expiry_fields": {}
+        },
+        {
+          "stage": "check_finalize",
+          "root_field_names": [
+            "expire_after",
+            "expire_at",
+            "persona",
+            "token"
+          ],
+          "explicit_expiry_fields": {
+            "expire_after": 540,
+            "expire_at": 1795523113
+          }
+        }
+      ],
+      "jwt_time_claims": []
+    }
+  ],
+  "schedule": [
+    {
+      "label": "unused_after_reported_expiry_plus_30",
+      "expire_after_s": 540,
+      "expire_at": 1795523105,
+      "target_age_s": 570
+    },
+    {
+      "label": "unused_after_reported_expiry_plus_60",
+      "expire_after_s": 540,
+      "expire_at": 1795523108,
+      "target_age_s": 600
+    },
+    {
+      "label": "unused_after_reported_expiry_plus_75",
+      "expire_after_s": 540,
+      "expire_at": 1795523111,
+      "target_age_s": 615
+    },
+    {
+      "label": "unused_after_reported_expiry_plus_360",
+      "expire_after_s": 540,
+      "expire_at": 1795523113,
+      "target_age_s": 900
+    }
+  ],
+  "conclusion": "unused checks accepted through the longest tested duration; no hard rejection boundary established",
+  "finished_at": "2026-11-24T20:31:21.390531+08:00"
+}

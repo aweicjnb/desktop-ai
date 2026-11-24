@@ -1,0 +1,7 @@
+{
+  "name": "desktop-ai-chatgpt-runtime",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": { "jsdom": "31.0.1" }
+}

@@ -54,6 +54,10 @@ class MonitorInfo(ct.Structure):
     _fields_ = [("size", w.DWORD), ("monitor", w.RECT), ("work", w.RECT), ("flags", w.DWORD)]
 
 
+class MonitorInfoEx(ct.Structure):
+    _fields_ = MonitorInfo._fields_ + [("device", w.WCHAR * 32)]
+
+
 user.GetAncestor.argtypes = (w.HWND, w.UINT)
 user.GetAncestor.restype = w.HWND
 user.GetForegroundWindow.restype = w.HWND
@@ -61,7 +65,7 @@ user.GetDpiForWindow.argtypes = (w.HWND,)
 user.GetDpiForWindow.restype = w.UINT
 user.MonitorFromPoint.argtypes = (w.POINT, w.DWORD)
 user.MonitorFromPoint.restype = w.HANDLE
-user.GetMonitorInfoW.argtypes = (w.HANDLE, ct.POINTER(MonitorInfo))
+user.GetMonitorInfoW.argtypes = (w.HANDLE, ct.c_void_p)
 user.GetMonitorInfoW.restype = w.BOOL
 user.GetWindowThreadProcessId.argtypes = (w.HWND, ct.POINTER(w.DWORD))
 user.RegisterHotKey.argtypes = (w.HWND, ct.c_int, w.UINT, w.UINT)
@@ -124,6 +128,32 @@ def monitor_work_area(x, y):
     return None
 
 
+def monitor_info(handle):
+    info = MonitorInfoEx(ct.sizeof(MonitorInfoEx))
+    if handle and user.GetMonitorInfoW(handle, ct.byref(info)):
+        rect = lambda value: (value.left, value.top, value.right, value.bottom)
+        return dict(id=info.device, bounds=rect(info.monitor), work=rect(info.work), primary=bool(info.flags & 1))
+    return None
+
+
+def monitor_at(x, y):
+    return monitor_info(user.MonitorFromPoint(w.POINT(round(x), round(y)), MONITOR_DEFAULTTONEAREST))
+
+
+def monitors():
+    result = []
+    callback_type = ct.WINFUNCTYPE(w.BOOL, w.HANDLE, w.HDC, ct.POINTER(w.RECT), w.LPARAM)
+    @callback_type
+    def collect(handle, _dc, _rect, _data):
+        info = monitor_info(handle)
+        if info:
+            result.append(info)
+        return True
+    user.EnumDisplayMonitors.argtypes = (w.HDC, ct.c_void_p, callback_type, w.LPARAM)
+    user.EnumDisplayMonitors(None, None, collect, 0)
+    return sorted(result, key=lambda value: (not value['primary'], value['id']))
+
+
 def window_dpi(hwnd):
     return user.GetDpiForWindow(hwnd) or 96
 
@@ -147,6 +177,19 @@ def open_edge(url, profile=None):
     if profile:
         command.append("--profile-directory=" + profile)
     subprocess.Popen([*command, url])
+
+
+def open_chrome(url):
+    candidates = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")),
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")),
+        Path(os.environ["LOCALAPPDATA"]),
+    ]
+    chrome = next((base / "Google/Chrome/Application/chrome.exe" for base in candidates
+                   if (base / "Google/Chrome/Application/chrome.exe").is_file()), None)
+    if chrome is None:
+        raise FileNotFoundError("未找到 Google Chrome，请安装后再连接 ChatGPT。")
+    subprocess.Popen([str(chrome), "--new-tab", url])
 
 
 class InputMethod:
@@ -229,7 +272,7 @@ class NativeEvents:
                                       IMAGE_ICON, icon_size, icon_size, LR_LOADFROMFILE)
         tray = NotifyIcon(
             cbSize=ct.sizeof(NotifyIcon), hwnd=hwnd, identifier=1, flags=1 | 2 | 4,
-            callback=TRAY_MESSAGE, icon=custom_icon or user.LoadIconW(None, 32512), tip="Desktop AI · DeepSeek",
+            callback=TRAY_MESSAGE, icon=custom_icon or user.LoadIconW(None, 32512), tip="Desktop AI",
         )
         try:
             self.tray_added = bool(hwnd and shell.Shell_NotifyIconW(0, ct.byref(tray)))

@@ -1,0 +1,29 @@
+{
+  "verified_at": "2026-11-24T20:31:44.635817+08:00",
+  "production_changed": false,
+  "reported_expire_after_seconds": [
+    540
+  ],
+  "tested_unused_ages_seconds": [
+    510.001,
+    555.001,
+    570.001,
+    600.001,
+    615.001,
+    900.001
+  ],
+  "all_samples_completed": true,
+  "maximum_observed_unused_acceptance_seconds": 900.001,
+  "hard_server_rejection_boundary_established": false,
+  "interpretation": "The service reports 540 seconds, but unused checks were accepted through 900 seconds. Fifteen minutes is an observed lower bound, not a measured expiry or a guaranteed lifetime.",
+  "recommended_client_policy": {
+    "deadline_source": "each response expire_at",
+    "refresh_lead_seconds": 30,
+    "single_use": true,
+    "check_deadline_again_before_submission": true
+  },
+  "evidence_files": [
+    "chatgpt-check-expiry-2026-11-24.json",
+    "chatgpt-check-expiry-extended-2026-11-24.json"
+  ]
+}
